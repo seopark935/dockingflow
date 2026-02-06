@@ -32,24 +32,24 @@ def load_setup(setup_path: Path) -> Dict[str, str]:
 
     return setup
 
-def load_tranches_tsv(tsv_path: Path) -> List[Tranche]:
+def load_tranches_tsv(map_path: Path) -> List[Tranche]:
     """Parse tranches.tsv with header: curl_script<TAB>log_p<TAB>molecular_weight."""
-    tsv_path = tsv_path.expanduser().resolve()
-    if not tsv_path.exists():
-        raise FileNotFoundError(f"mapping file not found: {tsv_path}")
+    map_path = map_path.expanduser().resolve()
+    if not map_path.exists():
+        raise FileNotFoundError(f"mapping file not found: {map_path}")
 
-    lines = [ln.rstrip("\n") for ln in tsv_path.read_text().splitlines() if ln.strip()]
+    lines = [ln.rstrip("\n") for ln in map_path.read_text().splitlines() if ln.strip()]
     if not lines:
         raise ValueError("mapping file is empty")
 
-    header = lines[0].split("\t")
+    header = lines[0].split()
     expected = ["curl_script", "log_p", "molecular_weight"]
     if header != expected:
         raise ValueError(f"Bad header. Expected {expected} but got {header}")
 
     tranches: List[Tranche] = []
     for i, ln in enumerate(lines[1:], start=2):
-        parts = ln.split("\t")
+        parts = ln.split()
         if len(parts) != 3:
             raise ValueError(f"Line {i}: expected 3 tab-separated fields, got {len(parts)}: {ln}")
         curl_script_s, logp_s, mw_s = parts
@@ -62,7 +62,7 @@ def load_tranches_tsv(tsv_path: Path) -> List[Tranche]:
         except ValueError:
             raise ValueError(f"Line {i}: molecular_weight is not an int: {mw_s}")
 
-        curl_script = (tsv_path.parent / curl_script_s).expanduser().resolve()
+        curl_script = (map_path.parent / curl_script_s).expanduser().resolve()
         tranches.append(Tranche(curl_script=curl_script, log_p=logp, molecular_weight=mw))
 
     return tranches
