@@ -1,0 +1,6 @@
+recList=recList.txt
+geoList=geoList.txt
+ligList=ligList.txt
+filter_percent=10
+cores=192
+energy_range=10
