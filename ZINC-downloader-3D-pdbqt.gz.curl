@@ -1,0 +1,33 @@
+#!/bin/bash
+# PLACEHOLDER download script for dockingflow testing.
+#
+# In production, replace this file with the real curl-command list downloaded
+# from the ZINC tranche picker (https://zinc20.docking.org or ZINC22), which
+# looks like:
+#   curl -o ZINC000000000001.pdbqt.gz https://files.docking.org/... --create-dirs
+#   curl -o ZINC000000000002.pdbqt.gz https://files.docking.org/... --create-dirs
+#   ...
+#
+# This placeholder instead synthesizes a couple of tiny fake ligands locally
+# so the pipeline can be exercised end-to-end without network access.
+set -e
+
+mkdir -p ZINC000000000001
+cat > ZINC000000000001/mol1.pdbqt <<'EOF'
+REMARK  Placeholder ligand for dockingflow testing
+ROOT
+ATOM      1  C1  LIG A   1       0.000   0.000   0.000  1.00  0.00     0.000 C
+ENDROOT
+TORSDOF 0
+EOF
+gzip -f ZINC000000000001/mol1.pdbqt
+
+mkdir -p ZINC000000000002
+cat > ZINC000000000002/mol2.pdbqt <<'EOF'
+REMARK  Placeholder ligand for dockingflow testing
+ROOT
+ATOM      1  C1  LIG A   1       1.000   1.000   1.000  1.00  0.00     0.000 C
+ENDROOT
+TORSDOF 0
+EOF
+gzip -f ZINC000000000002/mol2.pdbqt
