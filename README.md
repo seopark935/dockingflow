@@ -104,10 +104,14 @@ never conflicts with your settings.
 
 How it works: `gui.sh` starts `gui.py --web` detached in the background (it
 owns the run; log in `gui_server.log`) and then opens a window onto it
-through MobaXterm's X server — using a browser installed on the server
-(Chromium/Chrome/Firefox), or, if there is none, a small built-in window
-that `bash gui.sh setup` installs once (pywebview + Qt into `.venv`, no
-admin rights needed). If no window can be opened, `gui.sh` prints how to
+through MobaXterm's X server. That window is a Tkinter app
+([`gui_tk.py`](gui_tk.py)), which is fast over X11 because Tk sends small
+drawing commands rather than rendered pixels; it needs Python's `tkinter`
+(the `python3-tk` package on some Linux installs — `server_check.sh`
+reports whether it's there). Without tkinter, `gui.sh` falls back to a
+browser-based window — much slower over X11 — using a browser on the
+server, or pywebview installed by `bash gui.sh setup`.
+`bash gui.sh browser` forces the browser-based window. If no window can be opened, `gui.sh` prints how to
 reach the GUI from your own browser through a MobaXterm SSH tunnel
 instead. The web server listens on localhost only and requires the random
 token in its URL, so other users on a shared server can't control it.

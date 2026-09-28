@@ -2,17 +2,20 @@
 # DockingFlow GUI launcher for the docking server (e.g. over MobaXterm).
 #
 #   bash gui.sh           open the GUI (starts the GUI server first if needed)
+#   bash gui.sh browser   same, but in a browser window instead of the Tk one
 #   bash gui.sh status    is the GUI server running? print its URL
 #   bash gui.sh stop      stop the GUI server (also stops a run in progress;
 #                         starting a run again later resumes where it left off)
-#   bash gui.sh setup     optional: install a lightweight desktop window
-#                         (pywebview + Qt, into .venv) -- only needed if the
-#                         server has no web browser installed
+#   bash gui.sh setup     optional: install a browser-engine window (pywebview +
+#                         Qt, into .venv) -- only needed if the server has
+#                         neither tkinter nor a web browser
 #
 # How it works: the GUI server (`gui.py --web`) runs detached in the
 # background and owns any docking run, so runs keep going when you close
 # the window or MobaXterm. The window is just a view onto it, shown on your
-# own screen through MobaXterm's built-in X server (X11 forwarding).
+# own screen through MobaXterm's built-in X server (X11 forwarding). It's a
+# Tkinter window (gui_tk.py) when Python has tkinter -- much faster over X11
+# than a browser, which has to send every frame as pixels.
 
 cd "$(dirname "$0")" || exit 1
 PIDFILE=.gui_server.pid
@@ -69,14 +72,30 @@ open_window() {
 
     echo "Opening the GUI window on your screen (it may take a few seconds over the network)..."
 
-    # 1. A lightweight native window, if 'bash gui.sh setup' was run.
+    # 1. The Tkinter window: fast over X11, and part of Python itself.
+    #    ('bash gui.sh browser' skips it, to use a browser-based window instead.)
+    if [ "$WINDOW" != browser ]; then
+        local py
+        for py in "$PYTHON" /usr/bin/python3; do
+            if "$py" -c "import tkinter" 2>/dev/null; then
+                "$py" gui_tk.py "$u" 2>>"$LOG" && return
+                echo "(the Tk window failed; see $LOG -- trying a browser-based window instead)"
+                break
+            fi
+        done
+        [ -n "$py" ] && ! "$py" -c "import tkinter" 2>/dev/null && echo \
+            "(Python's tkinter isn't installed here -- ask your admin for the 'python3-tk' package" \
+            "for the fast window. Falling back to a slower browser-based window.)"
+    fi
+
+    # 2. A browser-engine window, if 'bash gui.sh setup' was run.
     local vpy=".venv/bin/python3"
     if [ -x "$vpy" ] && "$vpy" -c "import webview" 2>/dev/null; then
         "$vpy" gui.py --viewer "$u" 2>>"$LOG" && return
         echo "(the desktop window failed; see $LOG -- trying a browser instead)"
     fi
 
-    # 2. A browser installed on the server, as an app-style window.
+    # 3. A browser installed on the server, as an app-style window.
     local b
     for b in chromium chromium-browser google-chrome google-chrome-stable; do
         if command -v "$b" >/dev/null 2>&1; then
@@ -94,6 +113,7 @@ Tip: 'bash gui.sh setup' installs a small desktop window instead (no admin right
     return 1
 }
 
+WINDOW=""
 case "${1:-open}" in
     stop)
         if running; then kill "$(cat "$PIDFILE")"; echo "Stopped the GUI server."; else echo "Not running."; fi
@@ -113,7 +133,8 @@ case "${1:-open}" in
         .venv/bin/python3 -m pip install "pywebview[qt]" || exit 1
         echo "Done. Run 'bash gui.sh' to open the GUI."
         ;;
-    open)
+    open|browser)
+        WINDOW="$1"
         start_server
         if open_window; then
             echo
@@ -122,7 +143,7 @@ case "${1:-open}" in
         echo "Reopen with 'bash gui.sh'; stop everything with 'bash gui.sh stop'."
         ;;
     *)
-        echo "Usage: bash gui.sh [open|status|stop|setup]"
+        echo "Usage: bash gui.sh [open|browser|status|stop|setup]"
         exit 1
         ;;
 esac

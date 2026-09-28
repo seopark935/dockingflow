@@ -85,6 +85,11 @@ if [ -n "$DISPLAY" ]; then
 else
     echo "X11 forwarding: OFF -- in MobaXterm enable SSH > Advanced SSH settings > X11-Forwarding"
 fi
+if python3 -c "import tkinter" 2>/dev/null; then
+    echo "tkinter: installed -- 'bash gui.sh' opens the fast Tk window"
+else
+    echo "tkinter: MISSING -- ask your admin for the 'python3-tk' package (fast window); falls back to a browser"
+fi
 found_browser=""
 for b in chromium chromium-browser google-chrome google-chrome-stable firefox; do
     have "$b" && { echo "browser: $b -> $(command -v $b)"; found_browser=1; }
