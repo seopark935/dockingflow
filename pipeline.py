@@ -249,12 +249,18 @@ def download_tranche(tdir: Path) -> None:
     n_files = count_ligand_archives(download_dir)
     write_text(tdir / "download_timing.txt", f"rc={rc}\nseconds={dt:.2f}\nfiles={n_files}\n")
 
+    stderr_lines = stderr_log.read_text(errors="replace").splitlines()
+    failed = [ln for ln in stderr_lines if ln.startswith("FAILED")]
     if n_files == 0:
         write_status(tdir, "FAILED_DOWNLOAD")
-        raise RuntimeError(f"No ligand files downloaded for {tdir.name} (rc={rc}). See {stderr_log}")
+        reasons = sorted({ln.split(":", 1)[1].strip() for ln in stderr_lines if ln.startswith("curl: (")})
+        why = f" ({'; '.join(reasons)})" if reasons else ""
+        raise RuntimeError(
+            f"No ligand files downloaded for {tdir.name}: {len(failed)} download(s) failed{why}. "
+            f"ZINC's index lists some archives that exist on neither of its servers. See {stderr_log}"
+        )
 
     if rc != 0:
-        failed = [ln for ln in stderr_log.read_text(errors="replace").splitlines() if ln.startswith("FAILED")]
         failures_path = tdir / "download_failures.txt"
         write_text(failures_path, "".join(f"{ln}\n" for ln in failed))
         print(
@@ -743,10 +749,11 @@ def nuke_workdir(workdir: Path) -> None:
 def main() -> int:
     """CLI entry point: parse arguments and run the pipeline stages in order.
 
-    Unlike the GUI's runner (`gui.PipelineAPI._run`), this stops the whole
-    run on the first tranche that raises — there's no per-tranche error
-    isolation here, on the theory that an unattended CLI run should fail
-    loudly rather than silently produce partial results. Use
+    Like the GUI's runner (`gui.PipelineAPI._run`), a tranche that fails a
+    stage is reported and skipped for the remaining stages while the other
+    tranches carry on — ZINC regularly lists archives that don't exist, and
+    one such tranche shouldn't block a whole screen. Failures are summarized
+    at the end and make the exit code nonzero; re-running retries them. Use
     `--only-stage0` / `--only-download` / `--only-unpack` to stop early for
     inspection, or `--clean` / `--nuke` to reset a workdir between attempts.
     """
@@ -804,47 +811,50 @@ def main() -> int:
     if args.only_stage0:
         return 0
 
-    # Stage 1: download each tranche sequentially (safe default)
-    for tdir in tranche_dirs:
-        download_tranche(tdir)
+    failed: dict[str, str] = {}  # tranche name -> error, in failure order
 
-    print("\nDownload stage complete for all tranches.")
+    def run_stage(stage: str, fn, *args, **kwargs) -> None:
+        """Apply `fn` to every tranche that hasn't failed yet, recording failures instead of aborting."""
+        for tdir in tranche_dirs:
+            if tdir.name in failed:
+                continue
+            try:
+                fn(tdir, *args, **kwargs)
+            except Exception as exc:
+                failed[tdir.name] = f"{stage}: {exc}"
+                print(f"[FAILED] {tdir.name} ({stage}): {exc}")
+
+    def finish(what: str) -> int:
+        ok = len(tranche_dirs) - len(failed)
+        print(f"\n{what}: {ok} of {len(tranche_dirs)} tranche(s) succeeded.")
+        if failed:
+            print(f"{len(failed)} failed (re-run to retry them):")
+            for name, err in failed.items():
+                print(f"  {name}: {err}")
+        return 1 if failed else 0
+
+    # Stage 1: download each tranche sequentially (safe default)
+    run_stage("download", download_tranche)
     if args.only_download:
-        return 0
+        return finish("Download stage complete")
 
     # Stage 2: unpack downloaded ligands
-    for tdir in tranche_dirs:
-        unpack_tranche(tdir)
-
-    print("\nUnpack stage complete for all tranches.")
+    run_stage("unpack", unpack_tranche)
     if args.only_unpack:
-        return 0
+        return finish("Unpack stage complete")
 
     # Stage 3: dock each tranche's ligands against every (receptor, grid box) target
     targets = load_docking_targets(setup)
     options = load_vinalc_options(setup)
     mpirun_bin = None if args.no_mpirun else args.mpirun_bin
-
-    for tdir in tranche_dirs:
-        dock_tranche(
-            tdir,
-            targets,
-            options=options,
-            vinalc_bin=args.vinalc_bin,
-            mpirun_bin=mpirun_bin,
-        )
-
-    print("\nDocking stage complete for all tranches.")
+    run_stage("dock", dock_tranche, targets, options=options, vinalc_bin=args.vinalc_bin, mpirun_bin=mpirun_bin)
 
     # Stage 4: rank + filter results, then combine across tranches
-    filter_percent = float(setup["filter_percent"])
-    for tdir in tranche_dirs:
-        rank_and_filter_tranche(tdir, filter_percent)
+    run_stage("rank", rank_and_filter_tranche, float(setup["filter_percent"]))
 
     combined_path = combine_results(workdir, tranche_dirs)
-    print(f"\nPipeline complete for all tranches. Combined top hits: {combined_path}")
-    return 0
-
+    print(f"\nCombined top hits: {combined_path}")
+    return finish("Pipeline complete")
 
 if __name__ == "__main__":
     raise SystemExit(main())

@@ -1,0 +1,10 @@
+curl --retry 3 --retry-delay 1 --remote-time --fail --create-dirs -o H05/H05M000O.pdbqt.tgz https://files.docking.org/zinc22/zinc-22a/H05/H05M000/a/H05M000-O-aaaaaa.pdbqt.tgz
+curl --retry 3 --retry-delay 1 --remote-time --fail --create-dirs -o H05/H05M100O.pdbqt.tgz https://files.docking.org/zinc22/zinc-22a/H05/H05M100/a/H05M100-O-aaaaaa.pdbqt.tgz
+curl --retry 3 --retry-delay 1 --remote-time --fail --create-dirs -o H05/H05P020O.pdbqt.tgz https://files.docking.org/zinc22/zinc-22a/H05/H05P020/a/H05P020-O-aaaaaa.pdbqt.tgz
+curl --retry 3 --retry-delay 1 --remote-time --fail --create-dirs -o H05/H05P050N.pdbqt.tgz https://files.docking.org/zinc22/zinc-22a/H05/H05P050/a/H05P050-N-aaaaaa.pdbqt.tgz
+curl --retry 3 --retry-delay 1 --remote-time --fail --create-dirs -o H05/H05P050O.pdbqt.tgz https://files.docking.org/zinc22/zinc-22a/H05/H05P050/a/H05P050-O-aaaaaa.pdbqt.tgz
+curl --retry 3 --retry-delay 1 --remote-time --fail --create-dirs -o H05/H05P060N.pdbqt.tgz https://files.docking.org/zinc22/zinc-22a/H05/H05P060/a/H05P060-N-aaaaaa.pdbqt.tgz
+curl --retry 3 --retry-delay 1 --remote-time --fail --create-dirs -o H05/H05P060O.pdbqt.tgz https://files.docking.org/zinc22/zinc-22a/H05/H05P060/a/H05P060-O-aaaaaa.pdbqt.tgz
+curl --retry 3 --retry-delay 1 --remote-time --fail --create-dirs -o H06/H06M000M.pdbqt.tgz https://files.docking.org/zinc22/zinc-22a/H06/H06M000/a/H06M000-M-aaaaaa.pdbqt.tgz
+curl --retry 3 --retry-delay 1 --remote-time --fail --create-dirs -o H06/H06M000N.pdbqt.tgz https://files.docking.org/zinc22/zinc-22a/H06/H06M000/a/H06M000-N-aaaaaa.pdbqt.tgz
+curl --retry 3 --retry-delay 1 --remote-time --fail --create-dirs -o H06/H06M000O.pdbqt.tgz https://files.docking.org/zinc22/zinc-22a/H06/H06M000/a/H06M000-O-aaaaaa.pdbqt.tgz

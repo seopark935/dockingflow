@@ -45,6 +45,7 @@ from typing import Any
 import io_parse
 import pipeline
 import resources
+import zinc22
 import zinc_split
 
 REPO_ROOT = Path(__file__).resolve().parent
@@ -53,10 +54,7 @@ REPO_ROOT = Path(__file__).resolve().parent
 # settings in the GUI never blocks a `git pull` of code updates. Seeded on
 # first launch from the example files checked into the repo.
 PROJECT_DIR = REPO_ROOT / "project"
-PROJECT_SEED_FILES = [
-    "setup.txt", "recList.txt", "geoList.txt", "tranches.txt",
-    "protein.pdbqt", "ZINC-downloader-3D-pdbqt.gz.curl",
-]
+PROJECT_SEED_FILES = ["setup.txt", "recList.txt", "geoList.txt", "protein.pdbqt"]
 
 # Vina's documentation recommends search boxes of at most ~30 Å per side.
 LARGE_BOX_ANGSTROM = 30
@@ -69,6 +67,9 @@ def ensure_project_dir() -> Path:
         for name in PROJECT_SEED_FILES:
             if not (PROJECT_DIR / name).exists():
                 shutil.copy2(REPO_ROOT / name, PROJECT_DIR / name)
+        # No CPU/memory budget yet: the GUI recommends one for this machine,
+        # and saves the user's choice on the first Validate/Run.
+        resources.set_setup_keys(str(PROJECT_DIR / "setup.txt"), {"cores": None, "memory_gb": None})
     return PROJECT_DIR
 
 
@@ -129,7 +130,7 @@ class PipelineAPI:
         project = ensure_project_dir()
         return {
             "setup_path": str(project / "setup.txt"),
-            "map_path": str(project / "tranches.txt"),
+            "map_path": str(project / "zinc22_tranches.txt"),  # written by the Ligands tab
             "workdir": str(project / "run"),
             "vinalc_bin": "vinalc",
             "mpirun_bin": "mpirun",
@@ -182,14 +183,16 @@ class PipelineAPI:
     def import_zinc_downloader(self, downloader_path: str) -> dict[str, Any]:
         """Split a CartBlanche22 downloader file into per-tranche scripts + a tranche map.
 
-        Writes `<downloader's folder>/zinc22_scripts/<code>.curl` and
-        `<downloader's folder>/zinc22_tranches.txt`; the frontend then points
-        the "Tranches map" field at the latter.
+        Writes `project/zinc22_scripts/<code>.curl` and
+        `project/zinc22_tranches.txt` (the same place as the Ligands tab's
+        picker); the frontend then points the "Tranches map" field at the
+        latter.
         """
         try:
             src = Path(downloader_path).expanduser().resolve()
-            out_dir = src.parent / "zinc22_scripts"
-            map_path = src.parent / "zinc22_tranches.txt"
+            project = ensure_project_dir()
+            out_dir = project / "zinc22_scripts"
+            map_path = project / "zinc22_tranches.txt"
             counts = zinc_split.split_to_files(src, out_dir, map_path)
             n_files = sum(counts.values())
             return {
@@ -200,6 +203,87 @@ class PipelineAPI:
                     f"Tranches: {', '.join(counts)}\nTranche map: {map_path}"
                 ),
             }
+        except Exception as exc:
+            return {"ok": False, "message": str(exc)}
+
+    # ---- ZINC22 tranche picker: choices -> tranche map, no CartBlanche website ----
+
+    @staticmethod
+    def _zinc_selection(filters: dict[str, Any]) -> list[dict[str, Any]]:
+        index = zinc22.load_index(ensure_project_dir() / "zinc22_index.json")
+        return zinc22.select(
+            index,
+            int(filters["hac_min"]), int(filters["hac_max"]),
+            float(filters["logp_min"]), float(filters["logp_max"]),
+            list(filters["charges"]),
+        )
+
+    def zinc_summary(self, filters: dict[str, Any]) -> dict[str, Any]:
+        """How much of ZINC22 the current choices cover (first call downloads the index, ~10 MB)."""
+        try:
+            return {"ok": True, **zinc22.summarize(self._zinc_selection(filters))}
+        except Exception as exc:
+            return {"ok": False, "message": f"Couldn't read the ZINC22 index: {exc}"}
+
+    def zinc_build(self, filters: dict[str, Any]) -> dict[str, Any]:
+        """Build the per-tranche download scripts + tranche map for the chosen ZINC22 tranches."""
+        try:
+            project = ensure_project_dir()
+            map_path = project / "zinc22_tranches.txt"
+            res = zinc22.build_tranche_map(self._zinc_selection(filters), project / "zinc22_scripts", map_path)
+            return {
+                "ok": True,
+                "map_path": str(map_path),
+                "message": f"Tranche list ready: {res['tranches']} tranche(s), {res['files']} file(s) to download.",
+            }
+        except Exception as exc:
+            return {"ok": False, "message": str(exc)}
+
+    # ---- docking settings <-> setup.txt ----
+
+    SETTING_KEYS = ("filter_percent", "exhaustiveness", "num_modes", "energy_range", "seed", "granularity",
+                    "cores", "memory_gb")
+
+    def get_settings(self, setup_path: str) -> dict[str, Any]:
+        """setup.txt's docking settings, as strings for the form ("" = not set / default)."""
+        try:
+            setup = io_parse.load_setup(Path(setup_path))
+            return {"ok": True, "settings": {k: setup.get(k, "") for k in self.SETTING_KEYS}}
+        except Exception as exc:
+            return {"ok": False, "message": str(exc)}
+
+    def save_settings(self, setup_path: str, settings: dict[str, Any]) -> dict[str, Any]:
+        """Validate the form's docking settings and write them into setup.txt.
+
+        Blank optional fields are removed from setup.txt so the defaults
+        apply. Nothing is written unless every value is valid.
+        """
+        try:
+            updates = {k: (str(settings[k]).strip() or None) for k in self.SETTING_KEYS if k in settings}
+            for required in ("filter_percent", "cores"):
+                if required in updates and updates[required] is None:
+                    raise ValueError(f"{required} can't be blank")
+
+            candidate = io_parse.load_setup(Path(setup_path))
+            for k, v in updates.items():
+                if v is None:
+                    candidate.pop(k, None)
+                else:
+                    candidate[k] = v
+            try:
+                fp = float(candidate.get("filter_percent", "nan"))
+            except ValueError:
+                raise ValueError("Keep top % must be a number")
+            if not 0 < fp <= 100:
+                raise ValueError("Keep top % must be between 0 and 100")
+            # Same checks the pipeline itself runs (skipping the memory-based rank
+            # planning, which needs valid docking targets).
+            io_parse.load_vinalc_options({k: v for k, v in candidate.items() if k != "memory_gb"})
+            if candidate.get("memory_gb"):
+                io_parse._positive_number(candidate, "memory_gb")
+
+            resources.set_setup_keys(setup_path, updates)
+            return {"ok": True, "message": f"Saved settings to {Path(setup_path).name}."}
         except Exception as exc:
             return {"ok": False, "message": str(exc)}
 
@@ -309,10 +393,15 @@ class PipelineAPI:
         except Exception as exc:
             return {"ok": False, "message": str(exc)}
 
-    def plan_budget(self, setup_path: str, cores: int, memory_gb: float | None) -> dict[str, Any]:
-        """What a core/memory budget means for VinaLC (ranks, per-rank memory), for live display."""
+    def plan_budget(
+        self, setup_path: str, cores: int, memory_gb: float | None, exhaustiveness: int | None = None
+    ) -> dict[str, Any]:
+        """What a core/memory budget means for VinaLC (ranks, per-rank memory), for live display.
+
+        `exhaustiveness` lets the form preview an unsaved value.
+        """
         try:
-            return {"ok": True, **resources.plan(setup_path, int(cores), memory_gb)}
+            return {"ok": True, **resources.plan(setup_path, int(cores), memory_gb, exhaustiveness)}
         except Exception as exc:
             return {"ok": False, "message": str(exc)}
 

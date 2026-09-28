@@ -25,6 +25,7 @@ import io_parse
 import pipeline
 import resources
 import web_server
+import zinc22
 import zinc_split
 
 MOCK_VINALC = REPO_ROOT / "tests" / "fixtures" / "mock_vinalc.py"
@@ -41,7 +42,7 @@ class DockingFlowEndToEndTest(unittest.TestCase):
         self.workdir.mkdir()
 
         self.setup_path = REPO_ROOT / "setup.txt"
-        self.map_path = REPO_ROOT / "tranches.txt"
+        self.map_path = REPO_ROOT / "tests" / "fixtures" / "tranches.txt"
 
     def _load(self):
         setup = io_parse.load_setup(self.setup_path)
@@ -314,7 +315,53 @@ class ZincSplitTest(unittest.TestCase):
         tranches = io_parse.load_tranches_tsv(tmp / "tranches.txt")
         self.assertEqual([io_parse.tranche_label(t) for t in tranches], ["H04M000", "H17P050"])
         self.assertEqual((tranches[1].heavy_atoms, tranches[1].log_p), (17, 0.5))
-        self.assertEqual((tmp / "scripts" / "H04M000.curl").read_text().count("curl --fail"), 2)
+        script = (tmp / "scripts" / "H04M000.curl").read_text()
+        # Both archives kept apart (CartBlanche's own lines would write both to the same name) ...
+        self.assertIn("-o zinc-22a/H04/H04M000/a/H04M000-N-aaaaaa.pdbqt.tgz", script)
+        self.assertIn("-o zinc-22a/H04/H04M000/a/H04M000-O-aaaaaa.pdbqt.tgz", script)
+        # ... and fetched from ZINC's public S3 bucket, falling back to files.docking.org.
+        self.assertEqual(script.count(zinc22.S3_BASE), 2)
+        self.assertEqual(script.count(zinc22.DOCKING_ORG_BASE), 2)
+
+
+class Zinc22Test(unittest.TestCase):
+    KEY = "zinc-22a/H05/H05M000/a/H05M000-O-daaaaa.pdbqt.tgz"
+
+    def test_fix_download_line_accepts_every_cartblanche_format(self):
+        expected = zinc22.download_command(self.KEY)
+        for line in (
+            # curl, with CartBlanche's colliding output name
+            "curl --retry 3 --retry-delay 1 --remote-time --fail --create-dirs -o H05/H05M000O.pdbqt.tgz "
+            f"https://files.docking.org/zinc22/{self.KEY}",
+            f"s3://zinc3d/{self.KEY}",  # AWS
+            f"wget -x https://files.docking.org/zinc22/{self.KEY}",  # wget
+        ):
+            self.assertEqual(zinc22.fix_download_line(line), expected, line)
+        self.assertIsNone(zinc22.fix_download_line("# a comment"))
+        self.assertIsNone(zinc22.fix_download_line(""))
+
+    def test_download_command_uses_unique_path_and_s3(self):
+        cmd = zinc22.download_command(self.KEY)
+        self.assertTrue(cmd.startswith(f"curl -sS --fail --retry 3 --retry-delay 2 --create-dirs -o {self.KEY} {zinc22.S3_BASE}{self.KEY} || "))
+        self.assertTrue(cmd.endswith(f"{zinc22.DOCKING_ORG_BASE}{self.KEY}"))
+
+    def test_select_filters_ranges_and_charges(self):
+        index = [
+            {"name": "aH05M000N", "gen": "a", "hac": 5, "logp": 0.0, "charge": "N", "code": "H05M000", "molecules": 3},
+            {"name": "aH05P050O", "gen": "a", "hac": 5, "logp": 0.5, "charge": "O", "code": "H05P050", "molecules": 4},
+            {"name": "nH17P120N", "gen": "n", "hac": 17, "logp": 1.2, "charge": "N", "code": "H17P120", "molecules": 5},
+        ]
+        picked = zinc22.select(index, 5, 17, 0.0, 1.0, ["N", "O"])
+        self.assertEqual([t["name"] for t in picked], ["aH05M000N", "aH05P050O"])
+        self.assertEqual(zinc22.summarize(picked), {"tranches": 2, "subsets": 2, "molecules": 7})
+
+    def test_write_tranche_scripts_replaces_old_selection(self):
+        tmp = Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, tmp, ignore_errors=True)
+        (tmp / "scripts").mkdir()
+        (tmp / "scripts" / "H99P999.curl").write_text("stale")
+        zinc_split.write_tranche_scripts([zinc22.download_command(self.KEY)], "t", tmp / "scripts", tmp / "map.txt")
+        self.assertEqual(sorted(p.name for p in (tmp / "scripts").iterdir()), ["H05M000.curl"])
 
 
 class WebServerTest(unittest.TestCase):
@@ -396,6 +443,10 @@ class GuiEditingTest(unittest.TestCase):
         self.api = gui.PipelineAPI()
         self.tmp = Path(tempfile.mkdtemp())
         self.addCleanup(shutil.rmtree, self.tmp, ignore_errors=True)
+        # Keep the GUI's project/ folder inside the temp dir, not the repo.
+        self._project_dir = gui.PROJECT_DIR
+        gui.PROJECT_DIR = self.tmp / "project"
+        self.addCleanup(setattr, gui, "PROJECT_DIR", self._project_dir)
         for name in ("setup.txt", "recList.txt", "geoList.txt", "protein.pdbqt"):
             shutil.copy(REPO_ROOT / name, self.tmp / name)
         self.setup = str(self.tmp / "setup.txt")
@@ -410,6 +461,34 @@ class GuiEditingTest(unittest.TestCase):
         self.assertTrue(res["ok"], res)
         tranches = io_parse.load_tranches_tsv(Path(res["map_path"]))
         self.assertEqual([t.code for t in tranches], ["H04M000"])
+
+    def test_project_dir_seeded_without_budget(self):
+        project = self.gui.ensure_project_dir()
+        self.assertTrue((project / "setup.txt").exists())
+        setup = io_parse.load_setup(project / "setup.txt")
+        self.assertNotIn("cores", setup)  # the GUI recommends one for the actual machine
+        self.assertEqual(Path(setup["recList"]), (project / "recList.txt").resolve())
+
+    def test_settings_round_trip_and_validation(self):
+        got = self.api.get_settings(self.setup)["settings"]
+        self.assertEqual(got["filter_percent"], "10")
+        self.assertEqual(got["exhaustiveness"], "")
+
+        res = self.api.save_settings(self.setup, {
+            "filter_percent": "5", "exhaustiveness": "16", "seed": "42", "energy_range": "",
+            "cores": "8", "memory_gb": "12",
+        })
+        self.assertTrue(res["ok"], res)
+        setup = io_parse.load_setup(Path(self.setup))
+        self.assertEqual((setup["filter_percent"], setup["exhaustiveness"], setup["seed"]), ("5", "16", "42"))
+        self.assertNotIn("energy_range", setup)  # blank = back to the default
+        self.assertEqual(io_parse.load_vinalc_options(setup).exhaustiveness, 16)
+
+        before = Path(self.setup).read_text()
+        for bad in ({"exhaustiveness": "abc"}, {"filter_percent": "150"}, {"cores": ""}, {"seed": "1.5"},
+                    {"memory_gb": "-3"}):
+            self.assertFalse(self.api.save_settings(self.setup, bad)["ok"], bad)
+        self.assertEqual(Path(self.setup).read_text(), before)
 
     def test_import_empty_downloader_explains(self):
         dl = self.tmp / "empty.curl"

@@ -79,20 +79,24 @@ before pointing it at a real screen.
    A DockingFlow window opens on your own screen. Everything in it —
    machine detection, file browsing, downloads, docking — happens on the
    server.
-2. In the window, top to bottom:
-   - **Import ZINC downloader…** — pick the `.curl` file from
-     CartBlanche22 (copy it to the server first, e.g. by dragging it into
-     MobaXterm's file browser). It's split into one download script per
-     tranche and the Tranches map field is filled in.
-   - **Docking targets** — Browse to your prepared receptor `.pdbqt`, and
-     enter the grid box center and size (Å) around the binding pocket.
-     Add more receptors with **+ Add receptor**.
-   - **Docking binary** — `vinalc` if it's on PATH, otherwise its full
-     path.
-   - **Resources** — the server is detected automatically and the sliders
-     are pre-set to a recommendation; adjust if you're sharing the machine.
-   - **Validate**, then **Run pipeline**. Progress, the log, and the top
-     hits update live on the right.
+2. In the window, work through the tabs left to right:
+   - **Ligands** — pick the ZINC22 slice to screen (heavy atoms, logP,
+     charges); the tab shows how many tranches/molecules that is. Click
+     **Create tranche list** and the tranche list fills itself in (see
+     [ZINC22 downloads](#zinc22-downloads)). Set the **Work directory** to
+     somewhere with plenty of disk.
+   - **Targets** — Browse to your prepared receptor `.pdbqt`, and enter the
+     grid box center and size (Å) around the binding pocket. Add more
+     receptors with **+ Add receptor**.
+   - **Docking** — `vinalc` (or its full path), and the docking settings:
+     keep-top %, exhaustiveness, poses per ligand, energy range, seed.
+   - **Resources** — the server is detected automatically and the CPU/memory
+     sliders are pre-set to a recommendation; adjust if you share the
+     machine.
+   - **Validate**, then **Run pipeline**. All settings, targets and the
+     CPU/memory budget are saved to the settings file (`project/setup.txt`)
+     first, so the command line uses the same values. Progress, the log,
+     and the top hits update live on the right.
 3. Close the window or MobaXterm whenever you like: the run keeps going on
    the server. Run `bash gui.sh` again later to reopen the window and see
    live progress. `bash gui.sh stop` stops the GUI server (and any run in
@@ -116,6 +120,24 @@ reach the GUI from your own browser through a MobaXterm SSH tunnel
 instead. The web server listens on localhost only and requires the random
 token in its URL, so other users on a shared server can't control it.
 
+### ZINC22 downloads
+
+CartBlanche22's own **Download** button is unreliable for docking: it
+writes an empty file for tranches without 3D files (about 40% of its 3D
+browser, including everything with 30+ heavy atoms), and its curl commands
+give every archive of a tranche the same file name, so downloads overwrite
+each other. Its files.docking.org links also often fail (logins required
+for generation "n", some missing files).
+
+DockingFlow asks CartBlanche22's API only for the *list* of archives
+([`zinc22.py`](zinc22.py)), then downloads each one to its own path from
+ZINC's public AWS S3 bucket (`zinc3d`, plain HTTPS, no account or AWS CLI
+needed), falling back to files.docking.org. In testing S3 served ~92% of
+listed archives vs. ~60% from files.docking.org. Files missing from both are
+listed in the tranche's `download_failures.txt`, and the run continues.
+Importing a CartBlanche file (curl, wget or AWS format) applies the same
+fixes.
+
 ### With the command line
 
 1. **Check the machine.** Copy the repo over and run
@@ -132,7 +154,8 @@ token in its URL, so other users on a shared server can't control it.
    ```
    This writes one download script per tranche (e.g.
    `zinc22_scripts/H04M000.curl`) and a `curl_script tranche` mapping
-   file.
+   file. It accepts CartBlanche's curl, wget or AWS format and applies the
+   fixes described in [ZINC22 downloads](#zinc22-downloads).
 3. **Pick a CPU/memory budget** — either in the GUI's Resources panel (then
    **Save to setup file**), or by editing `cores=` / `memory_gb=` in
    `setup.txt` directly. See [CPU and memory](#cpu-and-memory).
@@ -398,11 +421,10 @@ Two files in this repo are intentionally placeholders so the pipeline runs
 end-to-end without network access or a real docking binary. **Replace both
 before running a real screen:**
 
-- **`ZINC-downloader-3D-pdbqt.gz.curl`** — synthesizes a tiny archive in
-  the real ZINC22 `.pdbqt.tgz` layout locally instead of hitting ZINC's
-  servers. For a real screen, run `zinc_split.py` on the downloader from
-  [CartBlanche22](https://cartblanche22.docking.org) and use the
-  `tranches.txt` it writes.
+- **`tests/fixtures/offline_downloader.curl`** (listed in the example
+  `tranches.txt`) — synthesizes a tiny archive in the real ZINC22
+  `.pdbqt.tgz` layout locally instead of hitting ZINC's servers. For a real
+  screen, use the GUI's Ligands tab (or `zinc_split.py`) instead.
 - **`protein.pdbqt`** — a minimal placeholder receptor (a few bare CA
   atoms, not a real prepared structure). Replace with a real receptor
   prepared for docking (e.g. via AutoDockTools/MGLTools or Meeko).

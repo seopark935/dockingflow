@@ -159,11 +159,14 @@ def recommend(res: dict[str, Any]) -> dict[str, Any]:
     return {"cores": cores, "memory_gb": memory_gb, "notes": notes}
 
 
-def plan(setup_path: str, cores: int, memory_gb: float | None) -> dict[str, Any]:
-    """What a given core/memory budget means for VinaLC, using setup.txt's boxes and settings."""
+def plan(setup_path: str, cores: int, memory_gb: float | None, exhaustiveness: int | None = None) -> dict[str, Any]:
+    """What a given core/memory budget means for VinaLC, using setup.txt's boxes and settings.
+
+    `exhaustiveness`, if given, overrides setup.txt's (to preview an unsaved form value).
+    """
     setup = io_parse.load_setup(Path(setup_path))
     targets = io_parse.load_docking_targets(setup)
-    exhaustiveness = int(setup.get("exhaustiveness", io_parse.DEFAULT_EXHAUSTIVENESS))
+    exhaustiveness = exhaustiveness or int(setup.get("exhaustiveness", io_parse.DEFAULT_EXHAUSTIVENESS))
     granularity = float(setup.get("granularity", io_parse.DEFAULT_GRANULARITY))
 
     rank_gb = io_parse.estimate_rank_memory_gb(targets, granularity)

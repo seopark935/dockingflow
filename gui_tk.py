@@ -32,6 +32,20 @@ MAX_HIT_ROWS = 500  # the full list is in top_hits_combined.tsv
 
 COLORS = {"ok": "#15803d", "err": "#b91c1c", "info": "#1d4ed8", "": "#374151"}
 
+LARGE_SCREEN = 5_000_000  # molecules; above this, confirm before building the list
+
+CHARGES = {"J": "-4", "K": "-3", "L": "-2", "M": "-1", "N": "0", "O": "+1", "P": "+2", "Q": "+3", "R": "+4"}
+
+# (setup.txt key, label, hint) for the Docking tab's settings fields.
+SETTINGS = [
+    ("filter_percent", "Keep top %", "share of each tranche's ranked ligands kept as hits"),
+    ("exhaustiveness", "Exhaustiveness", "search effort per ligand (default 8)"),
+    ("num_modes", "Poses per ligand", "binding poses reported (default 9)"),
+    ("energy_range", "Energy range", "kcal/mol window of reported poses (default 3)"),
+    ("seed", "Random seed", "optional; set for reproducible runs"),
+    ("granularity", "Grid spacing (Å)", "optional; default 0.375"),
+]
+
 
 class ApiClient:
     """Calls `PipelineAPI` methods on the GUI server: `api.validate(...)` -> POST /api/validate."""
@@ -72,6 +86,16 @@ class DockingFlowApp(tk.Tk):
 
         self.v = {name: tk.StringVar(self) for name in ("setup_path", "map_path", "workdir", "vinalc_bin", "mpirun_bin")}
         self.no_mpirun = tk.BooleanVar(self, value=False)
+
+        # Ligands tab: ZINC22 tranche picker
+        # Defaults: a small drug-like slice, so a first click can't start a billion-molecule screen.
+        self.hac_min, self.hac_max = tk.IntVar(self, value=17), tk.IntVar(self, value=17)
+        self.logp_min, self.logp_max = tk.DoubleVar(self, value=1.0), tk.DoubleVar(self, value=1.5)
+        self.charges = {c: tk.BooleanVar(self, value=c == "N") for c in CHARGES}
+        self._zinc_job = None
+
+        # Docking tab: settings saved into setup.txt
+        self.settings = {k: tk.StringVar(self) for k, _, _ in SETTINGS}
         self.cores = tk.IntVar(self, value=1)
         self.memory_gb = tk.IntVar(self, value=1)
 
@@ -115,8 +139,9 @@ class DockingFlowApp(tk.Tk):
 
         tabs = ttk.Notebook(left)
         tabs.pack(fill=tk.BOTH, expand=True)
-        tabs.add(self._build_inputs(tabs), text="Inputs")
-        tabs.add(self._build_targets_tab(tabs), text="Docking targets")
+        tabs.add(self._build_ligands(tabs), text="Ligands")
+        tabs.add(self._build_targets_tab(tabs), text="Targets")
+        tabs.add(self._build_docking(tabs), text="Docking")
         tabs.add(self._build_resources(tabs), text="Resources")
 
         actions = ttk.Frame(left, padding=(0, 8, 0, 0))
@@ -139,18 +164,58 @@ class DockingFlowApp(tk.Tk):
             ttk.Button(parent, text="Browse", command=lambda: self.browse(var, kind)).grid(
                 row=row + 1, column=1, padx=(4, 0))
 
-    def _build_inputs(self, parent: ttk.Notebook) -> ttk.Frame:
+    def _build_ligands(self, parent: ttk.Notebook) -> ttk.Frame:
         f = ttk.Frame(parent, padding=10)
         f.columnconfigure(0, weight=1)
-        self._file_row(f, 0, "Setup file (setup.txt)", self.v["setup_path"], "file")
-        self._file_row(f, 2, "Tranches map", self.v["map_path"], "file")
-        ttk.Button(f, text="Import ZINC downloader...", command=self.import_zinc).grid(
-            row=4, column=0, sticky="w", pady=(4, 0))
-        self._file_row(f, 5, "Work directory", self.v["workdir"], "folder")
-        self._file_row(f, 7, "Docking binary", self.v["vinalc_bin"], "file")
-        self._file_row(f, 9, "MPI launcher", self.v["mpirun_bin"], None)
+        pick = ttk.LabelFrame(f, text="Choose ZINC22 tranches", padding=8)
+        pick.grid(row=0, column=0, columnspan=2, sticky="ew")
+
+        def range_row(row: int, label: str, lo: tk.Variable, hi: tk.Variable, frm: float, to: float, inc: float) -> None:
+            ttk.Label(pick, text=label).grid(row=row, column=0, sticky="w", pady=2)
+            for col, var in ((1, lo), (3, hi)):
+                sb = ttk.Spinbox(pick, from_=frm, to=to, increment=inc, textvariable=var, width=6,
+                                 command=self.schedule_zinc_summary)
+                sb.grid(row=row, column=col, padx=2)
+                sb.bind("<KeyRelease>", lambda _e: self.schedule_zinc_summary())
+            ttk.Label(pick, text="to").grid(row=row, column=2)
+
+        range_row(0, "Heavy atoms", self.hac_min, self.hac_max, 4, 29, 1)
+        range_row(1, "logP", self.logp_min, self.logp_max, -5, 9, 0.1)
+        ttk.Label(pick, text="Charges").grid(row=2, column=0, sticky="nw", pady=(4, 0))
+        charges = ttk.Frame(pick)
+        charges.grid(row=2, column=1, columnspan=4, sticky="w", pady=(4, 0))
+        for k, (c, label) in enumerate(CHARGES.items()):
+            ttk.Checkbutton(charges, text=label, variable=self.charges[c], command=self.schedule_zinc_summary).grid(
+                row=k // 5, column=k % 5, sticky="w", padx=(0, 6))
+        self.zinc_label = ttk.Label(pick, text="", wraplength=380, justify=tk.LEFT, padding=(0, 6, 0, 0))
+        self.zinc_label.grid(row=3, column=0, columnspan=5, sticky="w")
+        ttk.Button(pick, text="Create tranche list", command=self.zinc_build).grid(
+            row=4, column=0, columnspan=2, sticky="w", pady=(6, 0))
+
+        self._file_row(f, 1, "Tranche list (filled in by the button above)", self.v["map_path"], "file")
+        ttk.Button(f, text="Or import a CartBlanche22 download file...", command=self.import_zinc).grid(
+            row=3, column=0, sticky="w", pady=(4, 0))
+        self._file_row(f, 4, "Work directory (downloads and results; needs lots of disk)", self.v["workdir"], "folder")
+        return f
+
+    def _build_docking(self, parent: ttk.Notebook) -> ttk.Frame:
+        f = ttk.Frame(parent, padding=10)
+        f.columnconfigure(0, weight=1)
+        self._file_row(f, 0, "Docking binary (vinalc, or its full path)", self.v["vinalc_bin"], "file")
+        self._file_row(f, 2, "MPI launcher", self.v["mpirun_bin"], None)
         ttk.Checkbutton(f, text="Skip MPI launcher (test mock only)", variable=self.no_mpirun).grid(
-            row=11, column=0, sticky="w", pady=(8, 0))
+            row=4, column=0, sticky="w", pady=(6, 0))
+
+        box = ttk.LabelFrame(f, text="Docking settings (saved to the settings file on Validate/Run)", padding=8)
+        box.grid(row=5, column=0, columnspan=2, sticky="ew", pady=(10, 0))
+        for r, (key, label, hint) in enumerate(SETTINGS):
+            ttk.Label(box, text=label).grid(row=r, column=0, sticky="w", pady=2)
+            e = ttk.Entry(box, textvariable=self.settings[key], width=8, justify=tk.RIGHT)
+            e.grid(row=r, column=1, padx=6)
+            ttk.Label(box, text=hint, foreground=COLORS[""]).grid(row=r, column=2, sticky="w")
+        self.settings["exhaustiveness"].trace_add("write", lambda *_: self.schedule_plan())
+
+        self._file_row(f, 6, "Settings file (setup.txt)", self.v["setup_path"], "file")
         self.v["setup_path"].trace_add("write", lambda *_: self.after_idle(self._setup_changed))
         return f
 
@@ -194,7 +259,6 @@ class DockingFlowApp(tk.Tk):
         buttons2 = ttk.Frame(f)
         buttons2.pack(fill=tk.X)
         ttk.Button(buttons2, text="Use recommended", command=self.use_recommended).pack(side=tk.LEFT)
-        ttk.Button(buttons2, text="Save to setup file", command=self.save_budget).pack(side=tk.LEFT, padx=6)
         return f
 
     def _tree(self, parent: tk.Widget, columns: List[tuple], height: int) -> ttk.Treeview:
@@ -240,6 +304,7 @@ class DockingFlowApp(tk.Tk):
         for key in self.v:
             self.v[key].set(d[key])
         self.detect_resources()
+        self.schedule_zinc_summary()
         s = self.call("get_status")
         if s:
             if s["phase"] == "running":
@@ -247,12 +312,118 @@ class DockingFlowApp(tk.Tk):
             elif s["phase"] in ("done", "error"):
                 self.set_message(s["message"], "ok" if s["phase"] == "done" else "err")
             else:
-                self.set_message("Check the three tabs, then click Validate.")
+                self.set_message("Work through the tabs left to right, then click Validate.")
         self.poll()
 
     def _setup_changed(self) -> None:
         self.load_targets()
+        self.load_settings()
         self.schedule_plan()
+
+    # ---------- settings <-> setup.txt ----------
+
+    def load_settings(self) -> None:
+        if not self.v["setup_path"].get():
+            return
+        res = self.call("get_settings", self.v["setup_path"].get())
+        if not res or not res["ok"]:
+            return
+        saved = res["settings"]
+        for key, _, _ in SETTINGS:
+            self.settings[key].set(saved.get(key, ""))
+        self._saved_budget = (saved.get("cores"), saved.get("memory_gb"))
+        self.apply_saved_budget()
+
+    def apply_saved_budget(self) -> None:
+        """Show the settings file's saved CPU/memory budget, if it fits this machine."""
+        cores, mem = getattr(self, "_saved_budget", (None, None))
+        if not self.machine or not cores:
+            return
+        try:
+            if int(cores) <= self.machine["logical_cpus"]:
+                self.cores.set(int(cores))
+            if mem and self.machine.get("mem_total_gb") and float(mem) <= self.machine["mem_total_gb"]:
+                self.memory_gb.set(int(float(mem)))
+        except ValueError:
+            return
+        self.schedule_plan()
+
+    def save_settings(self) -> bool:
+        """Write every docking setting and the CPU/memory budget into setup.txt."""
+        values = {key: self.settings[key].get() for key, _, _ in SETTINGS}
+        cores, mem = self.budget()
+        if cores is not None:
+            values["cores"] = str(cores)
+            values["memory_gb"] = str(int(mem)) if mem else ""
+        res = self.call("save_settings", self.v["setup_path"].get(), values)
+        if res is None:
+            return False
+        if not res["ok"]:
+            self.set_message(f"Docking settings: {res['message']}", "err")
+        return res["ok"]
+
+    def save_all(self) -> bool:
+        """Save targets (if edited) and settings; False if anything was invalid."""
+        if self.targets_dirty and not self.save_targets():
+            return False
+        return self.save_settings()
+
+    # ---------- ZINC22 tranche picker ----------
+
+    def _zinc_filters(self) -> Optional[Dict[str, Any]]:
+        try:
+            return {
+                "hac_min": int(self.hac_min.get()), "hac_max": int(self.hac_max.get()),
+                "logp_min": float(self.logp_min.get()), "logp_max": float(self.logp_max.get()),
+                "charges": [c for c, v in self.charges.items() if v.get()],
+            }
+        except (tk.TclError, ValueError):
+            return None
+
+    def schedule_zinc_summary(self) -> None:
+        if self._zinc_job:
+            self.after_cancel(self._zinc_job)
+        self._zinc_job = self.after(400, self.refresh_zinc_summary)
+
+    def refresh_zinc_summary(self) -> None:
+        self._zinc_job = None
+        filters = self._zinc_filters()
+        if filters is None:
+            self.zinc_label.configure(text="Enter numbers for the ranges.")
+            return
+        self.zinc_label.configure(text="Counting (the first time downloads ZINC22's index, ~10 MB)...")
+        self.update_idletasks()
+        res = self.call("zinc_summary", filters)
+        if res is None:
+            return
+        if not res["ok"]:
+            self.zinc_label.configure(text=res["message"])
+            return
+        self.zinc_label.configure(
+            text=f"{res['tranches']:,} tranche(s), about {res['molecules']:,} molecules."
+            + ("" if res["molecules"] < LARGE_SCREEN else "  That's a very large screen; consider narrowing it.")
+        )
+
+    def zinc_build(self) -> None:
+        filters = self._zinc_filters()
+        if filters is None:
+            self.set_message("Enter numbers for the heavy atom and logP ranges.", "err")
+            return
+        summary = self.call("zinc_summary", filters)
+        if summary and summary.get("ok") and summary["molecules"] > LARGE_SCREEN and not messagebox.askyesno(
+            "Large screen",
+            f"This selection is about {summary['molecules']:,} molecules in {summary['tranches']:,} tranches.\n\n"
+            "Docking that many takes a very long time and a lot of disk. Create the list anyway?",
+        ):
+            return
+        self.set_message("Getting the file list from ZINC22...", "info")
+        self.update_idletasks()
+        res = self.call("zinc_build", filters)
+        if res is None:
+            return
+        if res["ok"]:
+            self.v["map_path"].set(res["map_path"])
+        self.set_message(res["message"], "ok" if res["ok"] else "err")
 
     # ---------- file pickers + ZINC import ----------
 
@@ -376,6 +547,7 @@ class DockingFlowApp(tk.Tk):
         self.mem_scale.configure(to=max(1, int(m.get("mem_total_gb") or 1)),
                                  state=tk.NORMAL if m.get("mem_total_gb") else tk.DISABLED)
         self.use_recommended()
+        self.apply_saved_budget()
 
     def use_recommended(self) -> None:
         if not self.recommended:
@@ -400,7 +572,11 @@ class DockingFlowApp(tk.Tk):
         cores, mem = self.budget()
         if cores is None or not self.v["setup_path"].get():
             return
-        p = self.call("plan_budget", self.v["setup_path"].get(), cores, mem)
+        try:
+            exh = int(self.settings["exhaustiveness"].get() or 0) or None
+        except ValueError:
+            exh = None
+        p = self.call("plan_budget", self.v["setup_path"].get(), cores, mem, exh)
         if p is None:
             return
         if not p["ok"]:
@@ -417,34 +593,24 @@ class DockingFlowApp(tk.Tk):
             lines.append("Estimate exceeds currently available RAM.")
         self.plan_label.configure(text="\n".join(lines))
 
-    def save_budget(self) -> None:
-        cores, mem = self.budget()
-        if cores is None:
-            return
-        res = self.call("save_budget", self.v["setup_path"].get(), cores, mem)
-        if res:
-            self.set_message(res["message"], "ok" if res["ok"] else "err")
-
     # ---------- validate / run / clean ----------
 
     def validate(self) -> None:
-        if self.targets_dirty and not self.save_targets():
+        if not self.save_all():
             return
-        cores, mem = self.budget()
         self.set_message("Validating...", "info")
         self.update_idletasks()
-        res = self.call("validate", self.v["setup_path"].get(), self.v["map_path"].get(), self.v["workdir"].get(), cores, mem)
+        res = self.call("validate", self.v["setup_path"].get(), self.v["map_path"].get(), self.v["workdir"].get())
         if res:
             self.set_message(res["message"], "ok" if res["ok"] else "err")
 
     def start_run(self) -> None:
-        if self.targets_dirty and not self.save_targets():
+        if not self.save_all():
             return
-        cores, mem = self.budget()
         res = self.call(
             "start_run", self.v["setup_path"].get(), self.v["map_path"].get(), self.v["workdir"].get(),
             self.v["vinalc_bin"].get() or "vinalc", self.v["mpirun_bin"].get() or "mpirun",
-            self.no_mpirun.get(), cores, mem,
+            self.no_mpirun.get(),
         )
         if res is None:
             return
