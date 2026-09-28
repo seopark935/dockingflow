@@ -79,13 +79,28 @@ before pointing it at a real screen.
    A DockingFlow window opens on your own screen. Everything in it —
    machine detection, file browsing, downloads, docking — happens on the
    server.
-2. In the window: Browse to your setup file / tranche map / workdir, pick
-   CPU and memory with the Resources sliders (pre-set to a recommendation
-   for this server), Validate, then Run pipeline.
+2. In the window, top to bottom:
+   - **Import ZINC downloader…** — pick the `.curl` file from
+     CartBlanche22 (copy it to the server first, e.g. by dragging it into
+     MobaXterm's file browser). It's split into one download script per
+     tranche and the Tranches map field is filled in.
+   - **Docking targets** — Browse to your prepared receptor `.pdbqt`, and
+     enter the grid box center and size (Å) around the binding pocket.
+     Add more receptors with **+ Add receptor**.
+   - **Docking binary** — `vinalc` if it's on PATH, otherwise its full
+     path.
+   - **Resources** — the server is detected automatically and the sliders
+     are pre-set to a recommendation; adjust if you're sharing the machine.
+   - **Validate**, then **Run pipeline**. Progress, the log, and the top
+     hits update live on the right.
 3. Close the window or MobaXterm whenever you like: the run keeps going on
    the server. Run `bash gui.sh` again later to reopen the window and see
    live progress. `bash gui.sh stop` stops the GUI server (and any run in
    progress — re-running resumes where it stopped).
+
+The GUI keeps its settings in `project/` (created on first launch from the
+repo's example files, and ignored by git), so `git pull` for code updates
+never conflicts with your settings.
 
 How it works: `gui.sh` starts `gui.py --web` detached in the background (it
 owns the run; log in `gui_server.log`) and then opens a window onto it

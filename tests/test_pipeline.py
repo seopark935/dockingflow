@@ -386,5 +386,67 @@ class WebServerTest(unittest.TestCase):
         self.assertTrue(res["entries"][0]["is_dir"])  # directories first
 
 
+class GuiEditingTest(unittest.TestCase):
+    """GUI endpoints that edit config: ZINC import and docking targets."""
+
+    def setUp(self):
+        import gui
+
+        self.gui = gui
+        self.api = gui.PipelineAPI()
+        self.tmp = Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, self.tmp, ignore_errors=True)
+        for name in ("setup.txt", "recList.txt", "geoList.txt", "protein.pdbqt"):
+            shutil.copy(REPO_ROOT / name, self.tmp / name)
+        self.setup = str(self.tmp / "setup.txt")
+
+    def test_import_zinc_downloader(self):
+        dl = self.tmp / "ZINC22-downloader-3D-pdbqt.tgz.curl"
+        dl.write_text(
+            "curl --fail --create-dirs -o H04/H04M000/a/H04M000-N-aaaaaa.pdbqt.tgz "
+            "https://files.docking.org/zinc22/zinc-22a/H04/H04M000/a/H04M000-N-aaaaaa.pdbqt.tgz\n"
+        )
+        res = self.api.import_zinc_downloader(str(dl))
+        self.assertTrue(res["ok"], res)
+        tranches = io_parse.load_tranches_tsv(Path(res["map_path"]))
+        self.assertEqual([t.code for t in tranches], ["H04M000"])
+
+    def test_import_empty_downloader_explains(self):
+        dl = self.tmp / "empty.curl"
+        dl.write_text("")
+        res = self.api.import_zinc_downloader(str(dl))
+        self.assertFalse(res["ok"])
+        self.assertIn("empty", res["message"])
+
+    def test_get_and_save_targets_round_trip(self):
+        got = self.api.get_targets(self.setup)
+        self.assertEqual(got["targets"][0]["size"], ["80", "80", "80"])
+
+        res = self.api.save_targets(self.setup, [
+            {"receptor": str(self.tmp / "protein.pdbqt"), "center": ["1", "2", "3.5"], "size": ["20", "22", "24"]},
+        ])
+        self.assertTrue(res["ok"], res)
+        self.assertEqual(res["warnings"], [])
+        targets = io_parse.load_docking_targets(io_parse.load_setup(Path(self.setup)))
+        self.assertEqual((targets[0].box.center_z, targets[0].box.size_y), (3.5, 22.0))
+
+    def test_save_targets_validates_before_writing(self):
+        before = (self.tmp / "geoList.txt").read_text()
+        for bad in (
+            {"receptor": str(self.tmp / "missing.pdbqt"), "center": [0, 0, 0], "size": [20, 20, 20]},
+            {"receptor": str(self.tmp / "protein.pdbqt"), "center": ["a", 0, 0], "size": [20, 20, 20]},
+            {"receptor": str(self.tmp / "protein.pdbqt"), "center": [0, 0, 0], "size": [20, 0, 20]},
+        ):
+            self.assertFalse(self.api.save_targets(self.setup, [bad])["ok"])
+        self.assertEqual((self.tmp / "geoList.txt").read_text(), before)
+
+    def test_large_box_is_saved_with_warning(self):
+        res = self.api.save_targets(self.setup, [
+            {"receptor": str(self.tmp / "protein.pdbqt"), "center": [0, 0, 0], "size": [80, 80, 80]},
+        ])
+        self.assertTrue(res["ok"])
+        self.assertEqual(len(res["warnings"]), 1)
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -422,7 +422,7 @@ def validate_inputs(setup: Dict[str, str], tranches: List[Tranche], workdir: Pat
     """Fail fast on any malformed input before the pipeline does real work.
 
     Checks, in order: required setup.txt keys are present; recList/geoList
-    (and ligList, if given) point at existing files; filter_percent is a
+    point at existing files; filter_percent is a
     number in (0, 100]; the docking keys parse (via `load_vinalc_options`);
     recList/geoList pair up correctly (via `load_docking_targets`); at least
     one tranche was loaded; every tranche's curl_script exists and is
@@ -446,10 +446,8 @@ def validate_inputs(setup: Dict[str, str], tranches: List[Tranche], workdir: Pat
     if missing:
         raise ValueError(f"setup missing required keys: {missing}")
 
-    # Validate paths
-    for name in SETUP_PATH_KEYS:
-        if name not in setup:
-            continue
+    # Validate paths (ligList is unused, so a stale entry for it is harmless)
+    for name in ("recList", "geoList"):
         p = Path(setup[name]).expanduser().resolve()
         if not p.exists():
             raise FileNotFoundError(f"{name} does not exist: {p}")

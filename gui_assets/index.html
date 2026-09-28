@@ -262,6 +262,36 @@
 
   input[type="range"] { width: 100%; accent-color: var(--accent); }
 
+  /* Pinned Validate/Run bar at the bottom of the scrolling config card */
+  .actions {
+    position: sticky;
+    bottom: -16px;
+    margin: 0 -16px -16px;
+    padding: 12px 16px 16px;
+    background: var(--panel);
+    border-top: 1px solid var(--border);
+    display: flex;
+    flex-direction: column;
+    gap: 10px;
+  }
+
+  /* Docking target (receptor + grid box) editor */
+  .target {
+    background: var(--panel-2);
+    border: 1px solid var(--border);
+    border-radius: 6px;
+    padding: 8px 10px;
+    display: flex;
+    flex-direction: column;
+    gap: 6px;
+  }
+  .target-head { display: flex; justify-content: space-between; align-items: center; font-size: 11px; color: var(--text-dim); }
+  .target-head button { padding: 2px 8px; }
+  .box-row { display: grid; grid-template-columns: 44px repeat(3, 1fr); gap: 4px; align-items: center; }
+  .box-row span { font-size: 11px; color: var(--text-dim); }
+  .box-row input { text-align: right; }
+  .hint { font-size: 11px; color: var(--text-dim); line-height: 1.45; }
+
   /* In-page file picker (web mode, where there are no native dialogs) */
   .modal {
     position: fixed; inset: 0;
@@ -331,7 +361,7 @@
     <div class="field">
       <label>Setup file (setup.txt)</label>
       <div class="row">
-        <input type="text" id="setup_path" placeholder="/path/to/setup.txt">
+        <input type="text" id="setup_path" placeholder="/path/to/setup.txt" onchange="loadTargets()">
         <button class="small" onclick="browse('setup_path', 'file')">Browse</button>
       </div>
     </div>
@@ -342,6 +372,7 @@
         <input type="text" id="map_path" placeholder="/path/to/tranches.txt">
         <button class="small" onclick="browse('map_path', 'file')">Browse</button>
       </div>
+      <button class="small" onclick="importZinc()" style="align-self: flex-start">Import ZINC downloader&hellip;</button>
     </div>
 
     <div class="field">
@@ -350,6 +381,17 @@
         <input type="text" id="workdir" placeholder="/path/to/run">
         <button class="small" onclick="browse('workdir', 'folder')">Browse</button>
       </div>
+    </div>
+
+    <div class="divider"></div>
+
+    <h2>Docking targets</h2>
+    <div class="hint">Each receptor (a prepared .pdbqt) is docked within its grid box: the box center and
+      its size along x/y/z, in &Aring;ngstr&ouml;ms. Keep boxes around the binding pocket (&le; ~30 &Aring;).</div>
+    <div id="targets"></div>
+    <div class="btn-row">
+      <button class="small" onclick="addTarget()">+ Add receptor</button>
+      <button class="small" onclick="saveTargets()">Save targets</button>
     </div>
 
     <div class="divider"></div>
@@ -395,18 +437,17 @@
       <button class="small" id="saveBudgetBtn" onclick="saveBudget()" disabled>Save to setup file</button>
     </div>
 
-    <div class="divider"></div>
-
-    <div class="btn-row">
-      <button onclick="validate()">Validate</button>
-      <button class="primary" id="runBtn" onclick="startRun()">Run pipeline</button>
+    <div class="actions">
+      <div class="btn-row">
+        <button onclick="validate()">Validate</button>
+        <button class="primary" id="runBtn" onclick="startRun()">Run pipeline</button>
+      </div>
+      <div id="banner">Fill in the fields above, or use the defaults already loaded, then click Validate.</div>
+      <div class="btn-row">
+        <button class="small" onclick="cleanWorkdir()">Clean outputs</button>
+        <button class="small danger" onclick="nukeWorkdir()">Nuke workdir</button>
+      </div>
     </div>
-    <div class="btn-row">
-      <button class="small" onclick="cleanWorkdir()">Clean outputs</button>
-      <button class="small danger" onclick="nukeWorkdir()">Nuke workdir</button>
-    </div>
-
-    <div id="banner">Fill in the fields above, or use the defaults already loaded, then click Validate.</div>
   </div>
 
   <!-- Right column: status, log, results -->
@@ -492,7 +533,93 @@ async function browse(fieldId, kind) {
       ? await api().browse_folder()
       : await api().browse_file();
   }
-  if (path) document.getElementById(fieldId).value = path;
+  if (path) {
+    document.getElementById(fieldId).value = path;
+    if (fieldId === 'setup_path') { loadTargets(); onBudgetChange(); }
+  }
+}
+
+// Native dialog in the desktop app, in-page picker in web mode.
+async function pickFile(start) {
+  return window.DF_WEB ? pickPath('file', start) : api().browse_file();
+}
+
+// ---- ZINC import: CartBlanche22 downloader -> per-tranche scripts + tranche map ----
+
+async function importZinc() {
+  const path = await pickFile(fieldVal('map_path'));
+  if (!path) return;
+  setBanner('Importing...', 'info');
+  const res = await api().import_zinc_downloader(path);
+  if (res.ok) document.getElementById('map_path').value = res.map_path;
+  setBanner(res.message, res.ok ? 'ok' : 'err');
+}
+
+// ---- Docking targets: rows of receptor + grid box, saved to recList/geoList ----
+
+let targets = [];
+let targetsDirty = false;
+
+const emptyTarget = () => ({ receptor: '', center: ['', '', ''], size: ['20', '20', '20'] });
+
+async function loadTargets() {
+  const res = await api().get_targets(fieldVal('setup_path'));
+  if (!res.ok) { setBanner(`Couldn't read docking targets: ${res.message}`, 'err'); return; }
+  targets = res.targets.length ? res.targets : [emptyTarget()];
+  targetsDirty = false;
+  renderTargets();
+}
+
+function el(tag, props = {}, children = []) {
+  const e = Object.assign(document.createElement(tag), props);
+  e.append(...children);
+  return e;
+}
+
+function renderTargets() {
+  const edited = () => { targetsDirty = true; };
+  document.getElementById('targets').replaceChildren(...targets.map((t, i) => {
+    const receptor = el('input', { type: 'text', value: t.receptor, placeholder: '/path/to/receptor.pdbqt' });
+    receptor.oninput = () => { t.receptor = receptor.value.trim(); edited(); };
+    const browseBtn = el('button', { className: 'small', textContent: 'Browse' });
+    browseBtn.onclick = async () => {
+      const path = await pickFile(t.receptor || fieldVal('setup_path'));
+      if (path) { t.receptor = path; receptor.value = path; edited(); }
+    };
+    const numbers = (label, arr) => el('div', { className: 'box-row' }, [
+      el('span', { textContent: label }),
+      ...arr.map((v, k) => {
+        const inp = el('input', { type: 'text', value: v, inputMode: 'decimal', placeholder: 'xyz'[k] });
+        inp.oninput = () => { arr[k] = inp.value.trim(); edited(); };
+        return inp;
+      }),
+    ]);
+    const removeBtn = el('button', { className: 'small danger', textContent: 'Remove' });
+    removeBtn.onclick = () => { targets.splice(i, 1); edited(); renderTargets(); };
+    return el('div', { className: 'target' }, [
+      el('div', { className: 'target-head' }, [el('span', { textContent: `Receptor ${i + 1}` }), removeBtn]),
+      el('div', { className: 'row' }, [receptor, browseBtn]),
+      numbers('Center', t.center),
+      numbers('Size Å', t.size),
+    ]);
+  }));
+}
+
+function addTarget() {
+  targets.push(emptyTarget());
+  targetsDirty = true;
+  renderTargets();
+}
+
+// Returns whether the targets on disk now match the form.
+async function saveTargets() {
+  const res = await api().save_targets(fieldVal('setup_path'), targets);
+  setBanner(res.message, !res.ok ? 'err' : res.warnings.length ? 'info' : 'ok');
+  if (res.ok) {
+    targetsDirty = false;
+    if (machine) refreshPlan();  // the box size changes memory per worker
+  }
+  return res.ok;
 }
 
 // ---- In-page file picker (web mode): browses the server's filesystem ----
@@ -610,6 +737,7 @@ function useRecommended() {
 }
 
 function onBudgetChange() {
+  if (!machine) return;
   const b = budget();
   document.getElementById('coresVal').textContent = `${b.cores} / ${machine.logical_cpus}`;
   document.getElementById('memVal').textContent =
@@ -655,6 +783,7 @@ async function saveBudget() {
 }
 
 async function validate() {
+  if (targetsDirty && !(await saveTargets())) return;
   const c = currentConfig();
   const b = budget();
   setBanner('Validating...', 'info');
@@ -663,6 +792,7 @@ async function validate() {
 }
 
 async function startRun() {
+  if (targetsDirty && !(await saveTargets())) return;
   const c = currentConfig();
   const runBtn = document.getElementById('runBtn');
   runBtn.disabled = true;
@@ -783,6 +913,7 @@ window.addEventListener('pywebviewready', async () => {
   document.getElementById('workdir').value = d.workdir;
   document.getElementById('vinalc_bin').value = d.vinalc_bin;
   document.getElementById('mpirun_bin').value = d.mpirun_bin;
+  loadTargets();
   detectResources();
 
   // Reopening the page (web mode) while a run is in progress: pick it back up.

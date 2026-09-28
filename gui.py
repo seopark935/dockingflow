@@ -33,7 +33,9 @@ GUI favors showing partial progress over an all-or-nothing run.
 from __future__ import annotations
 
 import argparse
+import math
 import os
+import shutil
 import threading
 import traceback
 from dataclasses import dataclass, field
@@ -43,8 +45,31 @@ from typing import Any
 import io_parse
 import pipeline
 import resources
+import zinc_split
 
 REPO_ROOT = Path(__file__).resolve().parent
+
+# The GUI's own working copy of the config files. Git ignores it, so editing
+# settings in the GUI never blocks a `git pull` of code updates. Seeded on
+# first launch from the example files checked into the repo.
+PROJECT_DIR = REPO_ROOT / "project"
+PROJECT_SEED_FILES = [
+    "setup.txt", "recList.txt", "geoList.txt", "tranches.txt",
+    "protein.pdbqt", "ZINC-downloader-3D-pdbqt.gz.curl",
+]
+
+# Vina's documentation recommends search boxes of at most ~30 Å per side.
+LARGE_BOX_ANGSTROM = 30
+
+
+def ensure_project_dir() -> Path:
+    """Create `project/` from the repo's example config on first use; never overwrite it."""
+    if not (PROJECT_DIR / "setup.txt").exists():
+        PROJECT_DIR.mkdir(exist_ok=True)
+        for name in PROJECT_SEED_FILES:
+            if not (PROJECT_DIR / name).exists():
+                shutil.copy2(REPO_ROOT / name, PROJECT_DIR / name)
+    return PROJECT_DIR
 
 
 @dataclass
@@ -100,11 +125,12 @@ class PipelineAPI:
     # ---- defaults / file pickers ----
 
     def get_defaults(self) -> dict[str, str]:
-        """Prefill the form with this repo's own config files, for convenience."""
+        """Prefill the form with the GUI's `project/` config (created on first launch)."""
+        project = ensure_project_dir()
         return {
-            "setup_path": str(REPO_ROOT / "setup.txt"),
-            "map_path": str(REPO_ROOT / "tranches.txt"),
-            "workdir": str(REPO_ROOT / "run"),
+            "setup_path": str(project / "setup.txt"),
+            "map_path": str(project / "tranches.txt"),
+            "workdir": str(project / "run"),
             "vinalc_bin": "vinalc",
             "mpirun_bin": "mpirun",
         }
@@ -148,6 +174,112 @@ class PipelineAPI:
                         continue
             entries.sort(key=lambda e: (not e["is_dir"], e["name"].startswith("."), e["name"].lower()))
             return {"ok": True, "path": str(p), "parent": str(p.parent), "entries": entries}
+        except Exception as exc:
+            return {"ok": False, "message": str(exc)}
+
+    # ---- ZINC import ----
+
+    def import_zinc_downloader(self, downloader_path: str) -> dict[str, Any]:
+        """Split a CartBlanche22 downloader file into per-tranche scripts + a tranche map.
+
+        Writes `<downloader's folder>/zinc22_scripts/<code>.curl` and
+        `<downloader's folder>/zinc22_tranches.txt`; the frontend then points
+        the "Tranches map" field at the latter.
+        """
+        try:
+            src = Path(downloader_path).expanduser().resolve()
+            out_dir = src.parent / "zinc22_scripts"
+            map_path = src.parent / "zinc22_tranches.txt"
+            counts = zinc_split.split_to_files(src, out_dir, map_path)
+            n_files = sum(counts.values())
+            return {
+                "ok": True,
+                "map_path": str(map_path),
+                "message": (
+                    f"Imported {src.name}: {len(counts)} tranche(s), {n_files} download(s).\n"
+                    f"Tranches: {', '.join(counts)}\nTranche map: {map_path}"
+                ),
+            }
+        except Exception as exc:
+            return {"ok": False, "message": str(exc)}
+
+    # ---- docking targets (recList.txt + geoList.txt) ----
+
+    @staticmethod
+    def _target_list_paths(setup_path: str) -> tuple[Path, Path]:
+        setup = io_parse.load_setup(Path(setup_path))
+        setup_dir = Path(setup_path).expanduser().resolve().parent
+        rec = Path(setup["recList"]) if "recList" in setup else setup_dir / "recList.txt"
+        geo = Path(setup["geoList"]) if "geoList" in setup else setup_dir / "geoList.txt"
+        return rec, geo
+
+    def get_targets(self, setup_path: str) -> dict[str, Any]:
+        """The receptor + grid box rows from the setup's recList/geoList, for editing.
+
+        Lenient on purpose (unlike `io_parse.load_docking_targets`): missing
+        receptors or malformed lines are shown so they can be fixed here.
+        """
+        try:
+            rec, geo = self._target_list_paths(setup_path)
+            rec_lines = [ln.strip() for ln in rec.read_text().splitlines() if ln.strip()] if rec.exists() else []
+            geo_lines = [ln.split() for ln in geo.read_text().splitlines() if ln.strip()] if geo.exists() else []
+            targets = []
+            for i in range(max(len(rec_lines), len(geo_lines))):
+                receptor = str((rec.parent / rec_lines[i]).resolve()) if i < len(rec_lines) else ""
+                box = geo_lines[i] if i < len(geo_lines) else []
+                box = (box + [""] * 6)[:6]
+                targets.append({"receptor": receptor, "center": box[:3], "size": box[3:]})
+            return {"ok": True, "targets": targets, "rec_list": str(rec), "geo_list": str(geo)}
+        except Exception as exc:
+            return {"ok": False, "message": str(exc)}
+
+    def save_targets(self, setup_path: str, targets: list[dict[str, Any]]) -> dict[str, Any]:
+        """Validate the edited receptor/grid-box rows and write recList.txt + geoList.txt.
+
+        Each target is `{"receptor": path, "center": [x, y, z], "size": [x, y, z]}`.
+        Nothing is written unless every row is valid.
+        """
+        try:
+            if not targets:
+                raise ValueError("Add at least one receptor.")
+            rec_rows, geo_rows, warnings = [], [], []
+            for i, t in enumerate(targets, start=1):
+                receptor = Path(str(t.get("receptor", "")).strip()).expanduser()
+                if not str(receptor) or str(receptor) == ".":
+                    raise ValueError(f"Target {i}: choose a receptor file.")
+                receptor = receptor.resolve()
+                if not receptor.is_file():
+                    raise ValueError(f"Target {i}: receptor not found: {receptor}")
+                if receptor.suffix.lower() != ".pdbqt":
+                    raise ValueError(f"Target {i}: receptor must be a prepared .pdbqt file: {receptor.name}")
+                with open(receptor, errors="replace") as f:
+                    if not any(line.startswith(("ATOM", "HETATM")) for line in f):
+                        raise ValueError(f"Target {i}: {receptor.name} has no ATOM records")
+
+                try:
+                    center = [float(v) for v in t.get("center", [])]
+                    size = [float(v) for v in t.get("size", [])]
+                except (TypeError, ValueError):
+                    raise ValueError(f"Target {i}: box center and size must be numbers")
+                if len(center) != 3 or len(size) != 3 or not all(map(math.isfinite, center + size)):
+                    raise ValueError(f"Target {i}: box needs center x/y/z and size x/y/z")
+                if min(size) <= 0:
+                    raise ValueError(f"Target {i}: box sizes must be > 0")
+                if max(size) > LARGE_BOX_ANGSTROM:
+                    warnings.append(
+                        f"Target {i}: box is up to {max(size):g} Å per side. Vina recommends <= "
+                        f"{LARGE_BOX_ANGSTROM} Å around the binding pocket; bigger boxes dock slower, "
+                        f"less accurately, and need more memory per worker."
+                    )
+                rec_rows.append(str(receptor))
+                geo_rows.append(" ".join(f"{v:g}" for v in center + size))
+
+            rec, geo = self._target_list_paths(setup_path)
+            rec.write_text("\n".join(rec_rows) + "\n")
+            geo.write_text("\n".join(geo_rows) + "\n")
+            resources.set_setup_keys(setup_path, {"recList": str(rec), "geoList": str(geo)})
+            message = f"Saved {len(rec_rows)} docking target(s) to {rec.name} / {geo.name}."
+            return {"ok": True, "message": "\n".join([message] + warnings), "warnings": warnings}
         except Exception as exc:
             return {"ok": False, "message": str(exc)}
 

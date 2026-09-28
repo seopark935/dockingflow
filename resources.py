@@ -180,22 +180,30 @@ def plan(setup_path: str, cores: int, memory_gb: float | None) -> dict[str, Any]
     }
 
 
-def write_budget_to_setup(setup_path: str, cores: int, memory_gb: float | None) -> None:
-    """Set `cores=` and `memory_gb=` in setup.txt in place, keeping every other line as-is."""
-    path = Path(setup_path).expanduser()
-    lines = path.read_text().splitlines()
-    updates = {"cores": str(cores)}
-    if memory_gb is not None:
-        updates["memory_gb"] = f"{memory_gb:g}"
+def set_setup_keys(setup_path: str, updates: dict[str, str | None]) -> None:
+    """Set (or, for a `None` value, remove) `KEY=VALUE` lines in setup.txt in place.
 
+    Every other line, including comments, is kept as-is; keys not already
+    present are appended.
+    """
+    path = Path(setup_path).expanduser()
+    pending = dict(updates)
     out = []
-    for line in lines:
+    for line in path.read_text().splitlines():
         key = line.split("=", 1)[0].strip()
-        if "=" in line and not line.lstrip().startswith("#") and key in updates:
-            out.append(f"{key}={updates.pop(key)}")
-        elif "=" in line and key == "memory_gb" and memory_gb is None:
-            continue  # budget cleared: drop the old cap
+        if "=" in line and not line.lstrip().startswith("#") and key in pending:
+            val = pending.pop(key)
+            if val is not None:
+                out.append(f"{key}={val}")
         else:
             out.append(line)
-    out += [f"{k}={v}" for k, v in updates.items()]
+    out += [f"{k}={v}" for k, v in pending.items() if v is not None]
     path.write_text("\n".join(out) + "\n")
+
+
+def write_budget_to_setup(setup_path: str, cores: int, memory_gb: float | None) -> None:
+    """Set `cores=` and `memory_gb=` in setup.txt (removing `memory_gb` when there's no budget)."""
+    set_setup_keys(setup_path, {
+        "cores": str(cores),
+        "memory_gb": f"{memory_gb:g}" if memory_gb is not None else None,
+    })

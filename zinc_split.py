@@ -68,20 +68,21 @@ def split_downloader(lines: list[str]) -> tuple[dict[str, list[str]], list[str]]
     return groups, unmatched
 
 
-def main() -> int:
-    parser = argparse.ArgumentParser(description="Split a ZINC22 downloader script into per-tranche scripts")
-    parser.add_argument("downloader", help="The .curl/.wget file from CartBlanche22")
-    parser.add_argument("--out-dir", required=True, help="Directory to write per-tranche scripts into")
-    parser.add_argument("--map", required=True, help="Mapping file to write, for pipeline.py --map")
-    args = parser.parse_args()
+def split_to_files(src: Path, out_dir: Path, map_path: Path) -> dict[str, int]:
+    """Split downloader `src` into `<out_dir>/<code>.curl` scripts and a `map_path` mapping file.
 
-    src = Path(args.downloader).expanduser().resolve()
-    out_dir = Path(args.out_dir).expanduser().resolve()
-    map_path = Path(args.map).expanduser().resolve()
+    Returns:
+        Commands per tranche code, in file order.
 
-    groups, unmatched = split_downloader(src.read_text().splitlines())
+    Raises:
+        ValueError: If `src` is empty or contains no ZINC22 tranche codes.
+    """
+    text = src.read_text(errors="replace")
+    if not text.strip():
+        raise ValueError(f"{src.name} is empty. Download it again from CartBlanche22.")
+    groups, unmatched = split_downloader(text.splitlines())
     if not groups:
-        raise SystemExit(f"No ZINC22 tranche codes (e.g. H04M000) found in {src}")
+        raise ValueError(f"No ZINC22 tranche codes (e.g. H04M000) found in {src.name}. Is it a ZINC22 3D downloader?")
     if unmatched:
         # Anything without a tranche code (e.g. a stray `mkdir` of a shared
         # parent directory) can't be assigned to a tranche. `curl
@@ -94,11 +95,29 @@ def main() -> int:
         script = out_dir / f"{code}.curl"
         script.write_text(SCRIPT_HEADER.format(source=src.name, code=code) + "\n".join(cmds) + "\n" + SCRIPT_FOOTER)
         map_rows.append(f"{os.path.relpath(script, map_path.parent)}\t{code}")
-        print(f"{code}: {len(cmds)} command(s) -> {script}")
 
     map_path.parent.mkdir(parents=True, exist_ok=True)
     map_path.write_text("curl_script\ttranche\n" + "\n".join(map_rows) + "\n")
-    print(f"\nWrote {len(groups)} tranche script(s) and mapping file {map_path}")
+    return {code: len(cmds) for code, cmds in groups.items()}
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser(description="Split a ZINC22 downloader script into per-tranche scripts")
+    parser.add_argument("downloader", help="The .curl/.wget file from CartBlanche22")
+    parser.add_argument("--out-dir", required=True, help="Directory to write per-tranche scripts into")
+    parser.add_argument("--map", required=True, help="Mapping file to write, for pipeline.py --map")
+    args = parser.parse_args()
+
+    out_dir = Path(args.out_dir).expanduser().resolve()
+    map_path = Path(args.map).expanduser().resolve()
+    try:
+        counts = split_to_files(Path(args.downloader).expanduser().resolve(), out_dir, map_path)
+    except ValueError as exc:
+        raise SystemExit(str(exc))
+
+    for code, n in counts.items():
+        print(f"{code}: {n} command(s) -> {out_dir / (code + '.curl')}")
+    print(f"\nWrote {len(counts)} tranche script(s) and mapping file {map_path}")
     return 0
 
 
