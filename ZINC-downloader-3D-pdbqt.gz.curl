@@ -1,33 +1,38 @@
 #!/bin/bash
 # PLACEHOLDER download script for dockingflow testing.
 #
-# In production, replace this file with the real curl-command list downloaded
-# from the ZINC tranche picker (https://zinc20.docking.org or ZINC22), which
-# looks like:
-#   curl -o ZINC000000000001.pdbqt.gz https://files.docking.org/... --create-dirs
-#   curl -o ZINC000000000002.pdbqt.gz https://files.docking.org/... --create-dirs
-#   ...
+# In production, don't point tranches.txt at this file: run zinc_split.py on
+# the real downloader from CartBlanche22 (e.g.
+# ZINC22-downloader-3D-pdbqt.tgz.curl), which writes one script per tranche
+# plus a matching tranches.txt. Its lines look like:
+#   curl ... -o H04/H04M000/a/H04M000-N-aaaaaa.pdbqt.tgz https://files.docking.org/zinc22/zinc-22a/H04/H04M000/a/H04M000-N-aaaaaa.pdbqt.tgz
 #
-# This placeholder instead synthesizes a couple of tiny fake ligands locally
-# so the pipeline can be exercised end-to-end without network access.
+# This placeholder instead synthesizes a tiny archive locally, in the same
+# layout as a real ZINC22 .pdbqt.tgz (one single-molecule pdbqt per
+# compound, each with a "REMARK  Name =" line), so the pipeline can be
+# exercised end-to-end without network access.
 set -e
 
-mkdir -p ZINC000000000001
-cat > ZINC000000000001/mol1.pdbqt <<'EOF'
-REMARK  Placeholder ligand for dockingflow testing
-ROOT
-ATOM      1  C1  LIG A   1       0.000   0.000   0.000  1.00  0.00     0.000 C
-ENDROOT
-TORSDOF 0
-EOF
-gzip -f ZINC000000000001/mol1.pdbqt
+stage=$(mktemp -d)
+trap 'rm -rf "$stage"' EXIT
 
-mkdir -p ZINC000000000002
-cat > ZINC000000000002/mol2.pdbqt <<'EOF'
-REMARK  Placeholder ligand for dockingflow testing
+write_ligand() {  # <zinc id> <x offset>
+    local dir="$stage/H04/H04M000/${1:12:2}/${1:14:2}"
+    mkdir -p "$dir"
+    cat > "$dir/$1.0.N.pdbqt" <<EOF
+REMARK  Name = $1.0
 ROOT
-ATOM      1  C1  LIG A   1       1.000   1.000   1.000  1.00  0.00     0.000 C
+ATOM      1  C   LIG    1       $2   1.468   0.010  0.00  0.00    +0.360 C
 ENDROOT
-TORSDOF 0
+BRANCH   1   2
+ATOM      2  N   LIG    1        1.360   1.976  -0.000  0.00  0.00    -0.850 NA
+ENDBRANCH   1   2
+TORSDOF 1
 EOF
-gzip -f ZINC000000000002/mol2.pdbqt
+}
+
+write_ligand ZINC450000002E48 -0.018
+write_ligand ZINC450000002Jfn 0.500
+
+mkdir -p H04/H04M000/a
+tar -czf H04/H04M000/a/H04M000-N-aaaaaa.pdbqt.tgz -C "$stage" H04

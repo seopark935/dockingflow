@@ -4,3 +4,10 @@ ligList=ligList.txt
 filter_percent=10
 cores=192
 energy_range=10
+# Optional docking settings (VinaLC defaults shown):
+# memory_gb=<RAM budget in GB>   caps MPI ranks so VinaLC's grid maps fit in memory
+# exhaustiveness=8
+# num_modes=9
+# granularity=0.375
+# seed=<integer>
+# mpi_ranks=<n>                  overrides the cores/memory_gb-based rank count

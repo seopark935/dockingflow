@@ -27,17 +27,23 @@ import argparse
 import gzip
 import shutil
 import subprocess
+import tarfile
 import time
+import zlib
 from datetime import datetime
 from pathlib import Path
+from typing import Iterator
 
+import io_parse
 from io_parse import (
     DockingTarget,
     Tranche,
+    VinaLCOptions,
     format_summary,
     load_docking_targets,
     load_setup,
     load_tranches_tsv,
+    load_vinalc_options,
     validate_inputs,
 )
 
@@ -64,10 +70,7 @@ def status_at_least(status: str, target: str) -> bool:
         return False
 
 
-def tranche_label(t: Tranche) -> str:
-    """Filesystem-safe, deterministic tranche label."""
-    logp = f"{t.log_p:.2f}".rstrip("0").rstrip(".")
-    return f"LP{logp}_MW{t.molecular_weight}"
+tranche_label = io_parse.tranche_label
 
 
 def write_text(path: Path, text: str) -> None:
@@ -116,14 +119,23 @@ def run_cmd(cmd: list[str], cwd: Path, stdout_path: Path, stderr_path: Path) -> 
     return rc, time.time() - t0
 
 
-def count_pdbqt_gz(download_dir: Path) -> int:
-    """Count `*.pdbqt.gz` files anywhere under `download_dir`, recursively.
+# Downloaded ligand files the unpack stage knows how to read: ZINC22 3D
+# archives (.pdbqt.tgz), ZINC20-style gzipped pdbqt, and plain pdbqt.
+ARCHIVE_SUFFIXES = (".pdbqt.tgz", ".pdbqt.tar.gz", ".pdbqt.gz", ".pdbqt")
 
-    ZINC downloads land one compound per subdirectory (e.g.
-    `ZINC000000000001/mol1.pdbqt.gz`), so this must recurse rather than glob
-    the top level only.
+
+def find_ligand_archives(download_dir: Path) -> list[Path]:
+    """Every downloaded ligand file under `download_dir`, recursively, in sorted order.
+
+    ZINC downloads land in nested tranche subdirectories (e.g.
+    `H04/H04M000/a/H04M000-N-aaaaaa.pdbqt.tgz`), so this must recurse rather
+    than glob the top level only.
     """
-    return sum(1 for _ in download_dir.rglob("*.pdbqt.gz"))
+    return sorted(p for p in download_dir.rglob("*") if p.is_file() and p.name.endswith(ARCHIVE_SUFFIXES))
+
+
+def count_ligand_archives(download_dir: Path) -> int:
+    return len(find_ligand_archives(download_dir))
 
 
 # ----------------------------
@@ -140,7 +152,7 @@ def materialize_tranche(workdir: Path, tranche: Tranche, setup_path: Path) -> Pa
         audit trail so a run can be reproduced or debugged after the fact.
       - `status.txt`: created once, as "INIT", and never overwritten here.
       - `meta.txt`: created once, recording when the tranche was first
-        materialized and its (log_p, molecular_weight) identity.
+        materialized and its tranche identity.
 
     Safe to call repeatedly (e.g. on every pipeline re-run): it never
     overwrites `status.txt` or `meta.txt` once they exist, so a tranche's
@@ -173,8 +185,9 @@ def materialize_tranche(workdir: Path, tranche: Tranche, setup_path: Path) -> Pa
         write_text(
             meta_path,
             f"created_at={datetime.now().isoformat(timespec='seconds')}\n"
+            f"tranche={tranche_label(tranche)}\n"
             f"log_p={tranche.log_p}\n"
-            f"molecular_weight={tranche.molecular_weight}\n"
+            f"size={io_parse.tranche_size(tranche)}\n"
             f"curl_script_original={tranche.curl_script}\n"
         )
 
@@ -189,10 +202,17 @@ def download_tranche(tdir: Path) -> None:
     """Run a tranche's snapshotted curl script and verify it produced ligands.
 
     Skips entirely if the tranche has already reached "DOWNLOADED" or later
-    (idempotent/resumable). On failure — nonzero exit code, or an exit code
-    of 0 but zero `*.pdbqt.gz` files produced — writes "FAILED_DOWNLOAD" and
-    raises, so a caller looping over tranches can decide whether to abort
-    (CLI) or record the error and continue with the next tranche (GUI).
+    (idempotent/resumable). If the script produced no ligand files at all,
+    writes "FAILED_DOWNLOAD" and raises, so a caller looping over tranches
+    can decide whether to abort (CLI) or record the error and continue with
+    the next tranche (GUI).
+
+    A nonzero exit code with *some* files downloaded is treated as a partial
+    success: ZINC regularly 404s on individual archives, and failing the
+    whole tranche on those would make it impossible to ever finish. The
+    failed commands (as reported by the `zinc_split.py` script wrapper) are
+    written to `<tdir>/download_failures.txt` and a warning is printed; to
+    retry them, delete the tranche directory and re-run.
 
     Args:
         tdir: The tranche's workspace directory, as returned by
@@ -201,8 +221,7 @@ def download_tranche(tdir: Path) -> None:
 
     Raises:
         FileNotFoundError: If the curl script snapshot is missing.
-        RuntimeError: If the curl script exits nonzero, or exits 0 but
-            downloads no ligand files.
+        RuntimeError: If the curl script downloads no ligand files.
     """
     status = read_status(tdir)
     if status_at_least(status, "DOWNLOADED"):
@@ -216,7 +235,7 @@ def download_tranche(tdir: Path) -> None:
     download_dir.mkdir(parents=True, exist_ok=True)
     logs_dir.mkdir(parents=True, exist_ok=True)
 
-    curl_script = tdir / "inputs" / "curl_script.curl"
+    curl_script = (tdir / "inputs" / "curl_script.curl").resolve()  # absolute: it runs from download_dir
     if not curl_script.exists():
         write_status(tdir, "FAILED_DOWNLOAD")
         raise FileNotFoundError(f"Missing curl script snapshot: {curl_script}")
@@ -227,16 +246,21 @@ def download_tranche(tdir: Path) -> None:
     # Run curl script in download_dir so --create-dirs writes underneath it.
     rc, dt = run_cmd(["bash", str(curl_script)], cwd=download_dir, stdout_path=stdout_log, stderr_path=stderr_log)
 
-    n_files = count_pdbqt_gz(download_dir)
+    n_files = count_ligand_archives(download_dir)
     write_text(tdir / "download_timing.txt", f"rc={rc}\nseconds={dt:.2f}\nfiles={n_files}\n")
-
-    if rc != 0:
-        write_status(tdir, "FAILED_DOWNLOAD")
-        raise RuntimeError(f"Download failed for {tdir.name} (rc={rc}). See {stderr_log}")
 
     if n_files == 0:
         write_status(tdir, "FAILED_DOWNLOAD")
-        raise RuntimeError(f"No *.pdbqt.gz files downloaded for {tdir.name}. See logs in {logs_dir}")
+        raise RuntimeError(f"No ligand files downloaded for {tdir.name} (rc={rc}). See {stderr_log}")
+
+    if rc != 0:
+        failed = [ln for ln in stderr_log.read_text(errors="replace").splitlines() if ln.startswith("FAILED")]
+        failures_path = tdir / "download_failures.txt"
+        write_text(failures_path, "".join(f"{ln}\n" for ln in failed))
+        print(
+            f"[warn] {tdir.name}: download script exited rc={rc} with {len(failed)} failed command(s); "
+            f"continuing with {n_files} downloaded file(s). See {failures_path}"
+        )
 
     write_status(tdir, "DOWNLOADED")
 
@@ -245,14 +269,99 @@ def download_tranche(tdir: Path) -> None:
 # Stage 2: unpack
 # ----------------------------
 
-def unpack_tranche(tdir: Path) -> Path:
-    """Decompress a tranche's downloaded `*.pdbqt.gz` files into a flat ligand list.
+# Molecules per generated ligand file. VinaLC reads each file listed in its
+# ligList sequentially, so this only bounds file size (a ZINC22 tranche can
+# hold hundreds of thousands of molecules), not parallelism.
+LIGANDS_PER_FILE = 10000
 
-    Every ligand file, regardless of which per-compound subdirectory it was
-    downloaded into, is decompressed into a single flat `<tdir>/ligands/`
-    directory, and its path is written (one per line) to
-    `<tdir>/ligand_list.txt` — the file the docking stage points its docking
-    binary's `ligand_list` config option at.
+NAME_REMARK_PREFIX = "REMARK  Name = "
+
+
+def iter_pdbqt_texts(archive: Path) -> Iterator[tuple[str, str]]:
+    """Yield `(source_name, pdbqt_text)` for every pdbqt file in a downloaded file.
+
+    Handles ZINC22 `.pdbqt.tgz` archives (one small pdbqt per molecule,
+    read straight out of the archive without extracting to disk),
+    ZINC20-style `.pdbqt.gz`, and plain `.pdbqt`.
+    """
+    if archive.name.endswith((".pdbqt.tgz", ".pdbqt.tar.gz")):
+        with tarfile.open(archive, "r:gz") as tar:
+            for member in tar:
+                if not member.isfile() or not member.name.endswith(".pdbqt"):
+                    continue
+                f = tar.extractfile(member)
+                if f is not None:
+                    yield member.name, f.read().decode("utf-8", errors="replace")
+    elif archive.name.endswith(".pdbqt.gz"):
+        with gzip.open(archive, "rt", encoding="utf-8", errors="replace") as f:
+            yield archive.name, f.read()
+    else:
+        yield archive.name, archive.read_text(encoding="utf-8", errors="replace")
+
+
+def ligand_name(lines: list[str]) -> str | None:
+    """The molecule's `REMARK  Name = <id>` value (ZINC writes one per molecule), if any."""
+    for line in lines:
+        if line.startswith("REMARK") and "Name =" in line:
+            return line.split("=", 1)[1].strip() or None
+    return None
+
+
+def split_molecules(source_name: str, text: str) -> Iterator[tuple[str, list[str]]]:
+    """Yield `(ligand_id, lines)` for each molecule in one pdbqt file's text.
+
+    A file with `MODEL`/`ENDMDL` blocks holds one molecule per block; a file
+    without them is a single molecule. The returned lines never include
+    `MODEL`/`ENDMDL` themselves. The id is the molecule's
+    `REMARK  Name = ...` value, falling back to the source file name.
+    """
+    stem = source_name.rsplit("/", 1)[-1]
+    for suffix in (".gz", ".pdbqt"):
+        if stem.endswith(suffix):
+            stem = stem[: -len(suffix)]
+
+    lines = text.splitlines()
+    if any(ln.startswith("MODEL") for ln in lines):
+        blocks: list[list[str]] = []
+        current: list[str] | None = None
+        for ln in lines:
+            if ln.startswith("MODEL"):
+                current = []
+            elif ln.startswith("ENDMDL"):
+                if current is not None:
+                    blocks.append(current)
+                current = None
+            elif current is not None:
+                current.append(ln)
+    else:
+        blocks = [lines]
+
+    for i, block in enumerate(blocks, start=1):
+        if not any(ln.startswith(("ATOM", "HETATM")) for ln in block):
+            continue
+        name = ligand_name(block) or (stem if len(blocks) == 1 else f"{stem}_{i}")
+        yield name, block
+
+
+def unpack_tranche(tdir: Path) -> Path:
+    """Repackage a tranche's downloaded ligands into VinaLC's multi-molecule input format.
+
+    VinaLC treats every `MODEL`...`ENDMDL` block of each file in its ligList
+    as one docking job, and ignores anything outside those blocks — so a
+    plain single-molecule pdbqt (which is what ZINC22 archives contain)
+    would silently produce zero jobs. This reads every molecule out of
+    every downloaded file and writes them, each wrapped in `MODEL`/`ENDMDL`,
+    into `<tdir>/ligands/ligands_00001.pdbqt` etc. (`LIGANDS_PER_FILE` per
+    file). It also writes:
+
+      - `<tdir>/ligand_list.txt`: those files' paths, one per line, in
+        order — VinaLC's `--ligList`.
+      - `<tdir>/ligand_index.tsv`: `index  ligand  source`. VinaLC labels
+        results only as `LIGAND <n>`, counting molecules across the ligList
+        files in order, so this maps `n` back to the ZINC id.
+
+    A downloaded file that can't be read (e.g. a truncated download) is
+    skipped and listed in `<tdir>/unpack_warnings.txt`.
 
     Skips entirely if already "UNPACKED" or later. Requires the tranche to
     already be "DOWNLOADED".
@@ -266,7 +375,7 @@ def unpack_tranche(tdir: Path) -> Path:
 
     Raises:
         RuntimeError: If called before the download stage has completed, or
-            if no `*.pdbqt.gz` files are found to unpack.
+            if no molecules could be read from the downloaded files.
     """
     status = read_status(tdir)
     ligands_dir = tdir / "ligands"
@@ -278,22 +387,55 @@ def unpack_tranche(tdir: Path) -> Path:
 
     print(f"[unpack] {tdir.name}")
 
-    download_dir = tdir / "download"
-    ligands_dir.mkdir(parents=True, exist_ok=True)
-
-    gz_files = sorted(download_dir.rglob("*.pdbqt.gz"))
-    if not gz_files:
+    archives = find_ligand_archives(tdir / "download")
+    if not archives:
         write_status(tdir, "FAILED_UNPACK")
-        raise RuntimeError(f"No *.pdbqt.gz files found to unpack in {download_dir}")
+        raise RuntimeError(f"No ligand files found to unpack in {tdir / 'download'}")
 
-    ligand_paths: list[Path] = []
-    for gz_path in gz_files:
-        out_path = ligands_dir / gz_path.with_suffix("").name
-        with gzip.open(gz_path, "rb") as src, open(out_path, "wb") as dst:
-            shutil.copyfileobj(src, dst)
-        ligand_paths.append(out_path)
+    # Start clean so a previously interrupted unpack can't leave stale chunks behind.
+    if ligands_dir.exists():
+        shutil.rmtree(ligands_dir)
+    ligands_dir.mkdir(parents=True)
 
-    write_text(tdir / "ligand_list.txt", "\n".join(str(p) for p in ligand_paths) + "\n")
+    ligand_files: list[Path] = []
+    warnings: list[str] = []
+    n = 0
+    out = None
+    with open(tdir / "ligand_index.tsv", "w", encoding="utf-8") as index:
+        index.write("index\tligand\tsource\n")
+        try:
+            for archive in archives:
+                try:
+                    for source_name, text in iter_pdbqt_texts(archive):
+                        for name, lines in split_molecules(source_name, text):
+                            if n % LIGANDS_PER_FILE == 0:
+                                if out:
+                                    out.close()
+                                ligand_files.append(ligands_dir / f"ligands_{len(ligand_files) + 1:05d}.pdbqt")
+                                out = open(ligand_files[-1], "w", encoding="utf-8")
+                            n += 1
+                            out.write(f"MODEL {n}\n")
+                            if ligand_name(lines) is None:
+                                # Carry the id into VinaLC's output poses too.
+                                out.write(f"{NAME_REMARK_PREFIX}{name}\n")
+                            out.write("\n".join(lines) + "\nENDMDL\n")
+                            index.write(f"{n}\t{name}\t{archive.name}\n")
+                except (tarfile.TarError, OSError, EOFError, zlib.error) as exc:
+                    warnings.append(f"{archive}: {exc}")
+        finally:
+            if out:
+                out.close()
+
+    write_text(tdir / "unpack_warnings.txt", "".join(f"{w}\n" for w in warnings))
+    if warnings:
+        print(f"[warn] {tdir.name}: skipped {len(warnings)} unreadable file(s). See {tdir / 'unpack_warnings.txt'}")
+
+    if n == 0:
+        write_status(tdir, "FAILED_UNPACK")
+        raise RuntimeError(f"{tdir.name}: no molecules found in {len(archives)} downloaded file(s)")
+
+    print(f"[unpack] {tdir.name}: {n} molecule(s) from {len(archives)} file(s) into {len(ligand_files)} ligand file(s)")
+    write_text(tdir / "ligand_list.txt", "".join(f"{p}\n" for p in ligand_files))
     write_status(tdir, "UNPACKED")
     return ligands_dir
 
@@ -302,65 +444,66 @@ def unpack_tranche(tdir: Path) -> Path:
 # Stage 3: dock
 # ----------------------------
 
-def build_vinalc_config(
-    out_dir: Path, receptor: Path, box, ligand_list_path: Path, energy_range: str, num_modes: int = 9
-) -> Path:
-    """Write a vinalc-style KEY = VALUE config file for one (receptor, grid box) target.
+# VinaLC writes its combined results to "<recList arg>_<ligList arg>.pdbqt.gz"
+# (and ".log.gz") in its working directory, using the arguments verbatim —
+# so it's always run from the docking dir with these bare file names.
+VINALC_REC_LIST = "recList.txt"
+VINALC_GEO_LIST = "geoList.txt"
+VINALC_LIG_LIST = "ligList.txt"
+VINALC_POSES = f"{VINALC_REC_LIST}_{VINALC_LIG_LIST}.pdbqt.gz"
 
-    This mirrors the standard AutoDock Vina config format (which VinaLC also
-    accepts), so it should work unmodified against most Vina-family docking
-    binaries. If your specific binary expects a different config dialect,
-    this is the one function to adapt.
 
-    Args:
-        out_dir: Directory the config (and, once run, the docking outputs)
-            will live in.
-        receptor: Path to the receptor `.pdbqt`.
-        box: A `GridBox`-shaped object with center_x/y/z and size_x/y/z.
-        ligand_list_path: Path to the tranche's `ligand_list.txt`.
-        energy_range: Value of setup.txt's `energy_range`, passed through
-            verbatim as a string (Vina/VinaLC parses it itself).
-        num_modes: Maximum number of binding poses to report per ligand.
-
-    Returns:
-        Path to the written config file.
-    """
-    cfg_path = out_dir / "vinalc.conf"
+def write_vinalc_inputs(docking_dir: Path, targets: list[DockingTarget], ligand_list_path: Path) -> None:
+    """Write the three list files VinaLC reads, with absolute paths, into `docking_dir`."""
+    write_text(docking_dir / VINALC_REC_LIST, "".join(f"{t.receptor}\n" for t in targets))
     write_text(
-        cfg_path,
-        f"receptor = {receptor}\n"
-        f"ligand_list = {ligand_list_path}\n"
-        f"center_x = {box.center_x}\n"
-        f"center_y = {box.center_y}\n"
-        f"center_z = {box.center_z}\n"
-        f"size_x = {box.size_x}\n"
-        f"size_y = {box.size_y}\n"
-        f"size_z = {box.size_z}\n"
-        f"energy_range = {energy_range}\n"
-        f"num_modes = {num_modes}\n"
-        f"out_dir = {out_dir}\n",
+        docking_dir / VINALC_GEO_LIST,
+        "".join(
+            f"{b.center_x} {b.center_y} {b.center_z} {b.size_x} {b.size_y} {b.size_z}\n"
+            for b in (t.box for t in targets)
+        ),
     )
-    return cfg_path
+    shutil.copyfile(ligand_list_path, docking_dir / VINALC_LIG_LIST)
+
+
+def resolve_bin(name: str) -> str:
+    """Make a relative binary path (e.g. `./bin/vinalc`) absolute, since docking runs from another dir.
+
+    Bare names (`vinalc`, `mpirun`) are left for PATH lookup.
+    """
+    return str(Path(name).expanduser().resolve()) if "/" in name else name
+
+
+def build_vinalc_command(options: VinaLCOptions, vinalc_bin: str, mpirun_bin: str | None) -> list[str]:
+    """The full docking command line, run from the tranche's docking dir."""
+    cmd = [
+        resolve_bin(vinalc_bin),
+        "--recList", VINALC_REC_LIST,
+        "--ligList", VINALC_LIG_LIST,
+        "--geoList", VINALC_GEO_LIST,
+        *options.cli_args(),
+    ]
+    if mpirun_bin:
+        cmd = [resolve_bin(mpirun_bin), "-np", str(options.mpi_ranks), *cmd]
+    return cmd
 
 
 def dock_tranche(
     tdir: Path,
     targets: list[DockingTarget],
     *,
-    energy_range: str,
-    cores: int,
+    options: VinaLCOptions,
     vinalc_bin: str,
     mpirun_bin: str | None,
 ) -> None:
-    """Dock a tranche's unpacked ligands against every configured target.
+    """Dock a tranche's unpacked ligands against every configured target with one VinaLC run.
 
-    Runs one docking-binary invocation per `(receptor, grid box)` target in
-    `targets`, each against the tranche's full `ligand_list.txt`. Each
-    target gets its own subdirectory under `<tdir>/docking/target<i>_<receptor
-    stem>/`, containing its config file, docked output `*_out.pdbqt` files,
-    and timing info — so results from multiple targets never collide, and a
-    later `rank_and_filter_tranche` call can be pointed at the merged best
-    affinity across all of them.
+    VinaLC itself loops over every (receptor, grid box) in its recList/
+    geoList and every molecule in its ligList, farming each pair out to its
+    MPI worker ranks, so the whole tranche is a single
+    `mpirun -np <ranks> vinalc ...` call run from `<tdir>/docking/`. Its
+    combined poses land in `<tdir>/docking/recList.txt_ligList.txt.pdbqt.gz`
+    (with a matching `.log.gz`).
 
     Skips entirely if already "DOCKED" or later. Requires "UNPACKED".
 
@@ -368,18 +511,16 @@ def dock_tranche(
         tdir: The tranche's workspace directory.
         targets: One or more `(receptor, grid box)` pairs, as returned by
             `io_parse.load_docking_targets`.
-        energy_range: Passed straight through to `build_vinalc_config`.
-        cores: Degree of parallelism; passed as `mpirun -np <cores>` when
-            `mpirun_bin` is set.
-        vinalc_bin: Path/name of the docking binary to invoke.
+        options: Parsed docking settings (`io_parse.load_vinalc_options`),
+            including the MPI rank count.
+        vinalc_bin: Path/name of the VinaLC binary.
         mpirun_bin: MPI launcher to wrap `vinalc_bin` with, or `None` to
-            invoke `vinalc_bin` directly (e.g. for a single-core run, or
-            when testing against a mock binary that isn't MPI-aware).
+            invoke `vinalc_bin` directly (only useful for the offline test
+            mock; real VinaLC exits unless it has at least 2 MPI ranks).
 
     Raises:
         RuntimeError: If called before unpacking, if `ligand_list.txt` is
-            missing/empty, or if the docking binary exits nonzero for any
-            target.
+            missing/empty, or if VinaLC exits nonzero or writes no output.
     """
     status = read_status(tdir)
     if status_at_least(status, "DOCKED"):
@@ -398,27 +539,28 @@ def dock_tranche(
     docking_dir = tdir / "docking"
     logs_dir = tdir / "logs"
     docking_dir.mkdir(parents=True, exist_ok=True)
+    poses_path = docking_dir / VINALC_POSES
+    poses_path.unlink(missing_ok=True)  # never rank a stale result from an earlier failed attempt
 
-    for i, target in enumerate(targets, start=1):
-        target_dir = docking_dir / f"target{i}_{target.receptor.stem}"
-        target_dir.mkdir(parents=True, exist_ok=True)
+    write_vinalc_inputs(docking_dir, targets, ligand_list_path)
+    cmd = build_vinalc_command(options, vinalc_bin, mpirun_bin)
+    write_text(docking_dir / "command.txt", " ".join(cmd) + "\n")
 
-        cfg_path = build_vinalc_config(target_dir, target.receptor, target.box, ligand_list_path, energy_range)
+    stdout_log = logs_dir / "dock.stdout.log"
+    stderr_log = logs_dir / "dock.stderr.log"
+    try:
+        rc, dt = run_cmd(cmd, cwd=docking_dir, stdout_path=stdout_log, stderr_path=stderr_log)
+    except FileNotFoundError:
+        write_status(tdir, "FAILED_DOCK")
+        raise RuntimeError(f"{tdir.name}: docking binary not found: {cmd[0]} (put it on PATH or give its full path)")
+    write_text(docking_dir / "dock_timing.txt", f"rc={rc}\nseconds={dt:.2f}\n")
 
-        cmd = (
-            [mpirun_bin, "-np", str(cores), vinalc_bin, "--config", str(cfg_path)]
-            if mpirun_bin
-            else [vinalc_bin, "--config", str(cfg_path)]
-        )
-
-        stdout_log = logs_dir / f"dock_target{i}.stdout.log"
-        stderr_log = logs_dir / f"dock_target{i}.stderr.log"
-        rc, dt = run_cmd(cmd, cwd=target_dir, stdout_path=stdout_log, stderr_path=stderr_log)
-        write_text(target_dir / "dock_timing.txt", f"rc={rc}\nseconds={dt:.2f}\n")
-
-        if rc != 0:
-            write_status(tdir, "FAILED_DOCK")
-            raise RuntimeError(f"Docking failed for {tdir.name} target {i} (rc={rc}). See {stderr_log}")
+    if rc != 0:
+        write_status(tdir, "FAILED_DOCK")
+        raise RuntimeError(f"Docking failed for {tdir.name} (rc={rc}). See {stderr_log}")
+    if not poses_path.exists():
+        write_status(tdir, "FAILED_DOCK")
+        raise RuntimeError(f"Docking for {tdir.name} exited 0 but wrote no {poses_path.name}. See {stdout_log}")
 
     write_status(tdir, "DOCKED")
 
@@ -427,34 +569,65 @@ def dock_tranche(
 # Stage 4: rank + filter
 # ----------------------------
 
-def parse_best_affinities(out_dir: Path) -> dict[str, float]:
-    """Read docked *_out.pdbqt files and return {ligand_stem: best_affinity_kcal_mol}.
+def parse_vinalc_poses(poses_path: Path) -> Iterator[tuple[str, int, float]]:
+    """Yield `(receptor, ligand_number, best_affinity)` per docked pair in a VinaLC output file.
 
-    Vina/VinaLC list poses best-first, so the first 'REMARK VINA RESULT:' line
-    in each output file is that ligand's best-scoring pose.
+    VinaLC appends one record per (receptor, ligand) job, in completion
+    order (not input order)::
+
+        REMARK RECEPTOR /abs/path/protein.pdbqt
+        REMARK LIGAND LIGAND 12
+        MODEL 1
+        REMARK VINA RESULT:      -7.4      0.000      0.000
+        ...
+        ENDMDL
+        MODEL 2 ...
+
+    Poses are best-first, so the first `REMARK VINA RESULT:` of a record is
+    its best affinity. A job that found no pose inside the box has no
+    `VINA RESULT` line and is skipped.
     """
-    best: dict[str, float] = {}
-    for out_path in sorted(out_dir.glob("*_out.pdbqt")):
-        for line in out_path.read_text().splitlines():
-            if line.startswith("REMARK VINA RESULT:"):
-                best[out_path.stem[: -len("_out")]] = float(line.split()[3])
-                break
-    return best
+    receptor: str | None = None
+    number: int | None = None
+    best: float | None = None
+    with gzip.open(poses_path, "rt", encoding="utf-8", errors="replace") as f:
+        for line in f:
+            if line.startswith("REMARK RECEPTOR"):
+                if receptor is not None and number is not None and best is not None:
+                    yield receptor, number, best
+                receptor, number, best = line[len("REMARK RECEPTOR"):].strip(), None, None
+            elif line.startswith("REMARK LIGAND"):
+                number = int(line.split()[-1])
+            elif best is None and line.startswith("REMARK VINA RESULT:"):
+                best = float(line.split()[3])
+    if receptor is not None and number is not None and best is not None:
+        yield receptor, number, best
+
+
+def read_ligand_index(tdir: Path) -> dict[int, str]:
+    """Map VinaLC's `LIGAND <n>` numbers back to ligand ids, from `ligand_index.tsv`."""
+    index: dict[int, str] = {}
+    with open(tdir / "ligand_index.tsv", encoding="utf-8") as f:
+        next(f)  # header
+        for line in f:
+            n, name, _source = line.rstrip("\n").split("\t")
+            index[int(n)] = name
+    return index
 
 
 def rank_and_filter_tranche(tdir: Path, filter_percent: float) -> Path:
     """Rank a tranche's docked ligands by best binding affinity and keep the top slice.
 
-    Merges best-affinity results across every target the tranche was docked
-    against (if a ligand appears under multiple targets, the last target
-    processed wins — in practice tranches are docked against a small, fixed
-    set of targets, so this is rarely a meaningful ambiguity), sorts
-    ascending by affinity (more negative kcal/mol = stronger predicted
-    binding = better), and writes:
+    Reads VinaLC's combined output, maps each `LIGAND <n>` back to its ZINC
+    id via `ligand_index.tsv`, keeps each ligand's best affinity across all
+    receptors (noting which receptor it came from), sorts ascending (more
+    negative kcal/mol = stronger predicted binding = better), and writes:
 
       - `<tdir>/results/ranked_all.tsv`: every docked ligand, best-first.
       - `<tdir>/results/top_hits.tsv`: the top `filter_percent`% slice
         (at least 1 ligand, even if `filter_percent` would round down to 0).
+      - `<tdir>/results/summary.txt`: how many molecules were docked
+        successfully out of how many were submitted.
 
     Requires the tranche to already be "DOCKED"; sets it to "DONE" on success.
 
@@ -468,34 +641,39 @@ def rank_and_filter_tranche(tdir: Path, filter_percent: float) -> Path:
 
     Raises:
         RuntimeError: If called before docking, or if no docking results
-            (`*_out.pdbqt` files with a parseable affinity) are found.
+            with a parseable affinity are found.
     """
     status = read_status(tdir)
     if not status_at_least(status, "DOCKED"):
         raise RuntimeError(f"{tdir.name}: cannot rank before docking (status={status})")
 
-    affinities: dict[str, float] = {}
-    for target_dir in sorted((tdir / "docking").glob("target*")):
-        affinities.update(parse_best_affinities(target_dir))
+    index = read_ligand_index(tdir)
+    best: dict[str, tuple[float, str]] = {}
+    for receptor, number, affinity in parse_vinalc_poses(tdir / "docking" / VINALC_POSES):
+        lig = index.get(number, f"LIGAND_{number}")
+        if lig not in best or affinity < best[lig][0]:
+            best[lig] = (affinity, Path(receptor).stem)
 
-    if not affinities:
+    if not best:
         write_status(tdir, "FAILED_RANK")
         raise RuntimeError(f"{tdir.name}: no docking results found to rank")
 
-    ranked = sorted(affinities.items(), key=lambda kv: kv[1])
+    ranked = sorted(best.items(), key=lambda kv: kv[1][0])
+    header = "ligand\taffinity_kcal_mol\treceptor\n"
     results_dir = tdir / "results"
     write_text(
         results_dir / "ranked_all.tsv",
-        "ligand\taffinity_kcal_mol\n" + "\n".join(f"{lig}\t{aff:.3f}" for lig, aff in ranked) + "\n",
+        header + "".join(f"{lig}\t{aff:.3f}\t{rec}\n" for lig, (aff, rec) in ranked),
     )
 
     n_keep = max(1, round(len(ranked) * filter_percent / 100))
-    top = ranked[:n_keep]
     top_path = results_dir / "top_hits.tsv"
-    write_text(
-        top_path,
-        "ligand\taffinity_kcal_mol\n" + "\n".join(f"{lig}\t{aff:.3f}" for lig, aff in top) + "\n",
-    )
+    write_text(top_path, header + "".join(f"{lig}\t{aff:.3f}\t{rec}\n" for lig, (aff, rec) in ranked[:n_keep]))
+
+    submitted = len(set(index.values()))
+    write_text(results_dir / "summary.txt", f"submitted={submitted}\ndocked={len(ranked)}\ntop_hits={n_keep}\n")
+    if len(ranked) < submitted:
+        print(f"[warn] {tdir.name}: only {len(ranked)} of {submitted} ligands produced a pose")
 
     write_status(tdir, "DONE")
     return top_path
@@ -503,7 +681,7 @@ def rank_and_filter_tranche(tdir: Path, filter_percent: float) -> Path:
 
 def combine_results(workdir: Path, tranche_dirs: list[Path]) -> Path:
     """Merge every tranche's top_hits.tsv into one workdir-level ranking."""
-    combined: list[tuple[str, float, str]] = []
+    combined: list[tuple[str, float, str, str]] = []
     for tdir in tranche_dirs:
         top_path = tdir / "results" / "top_hits.tsv"
         if not top_path.exists():
@@ -511,16 +689,15 @@ def combine_results(workdir: Path, tranche_dirs: list[Path]) -> Path:
         for line in top_path.read_text().splitlines()[1:]:
             if not line.strip():
                 continue
-            lig, aff = line.split("\t")
-            combined.append((lig, float(aff), tdir.name))
+            lig, aff, receptor = line.split("\t")
+            combined.append((lig, float(aff), receptor, tdir.name))
 
     combined.sort(key=lambda row: row[1])
     out_path = workdir / "results" / "top_hits_combined.tsv"
     write_text(
         out_path,
-        "ligand\taffinity_kcal_mol\ttranche\n"
-        + "\n".join(f"{lig}\t{aff:.3f}\t{tranche}" for lig, aff, tranche in combined)
-        + "\n",
+        "ligand\taffinity_kcal_mol\treceptor\ttranche\n"
+        + "".join(f"{lig}\t{aff:.3f}\t{rec}\t{tranche}\n" for lig, aff, rec, tranche in combined),
     )
     return out_path
 
@@ -574,7 +751,7 @@ def main() -> int:
     inspection, or `--clean` / `--nuke` to reset a workdir between attempts.
     """
     parser = argparse.ArgumentParser(
-        description="Docking pipeline orchestrator (Stage 0 + Download stage)"
+        description="DockingFlow: download ZINC tranches, dock them with VinaLC, rank the hits"
     )
     parser.add_argument("--map", required=True, help="Path to tranches.tsv (tab-separated)")
     parser.add_argument("--setup", required=True, help="Path to setup.txt (KEY=VALUE)")
@@ -645,16 +822,14 @@ def main() -> int:
 
     # Stage 3: dock each tranche's ligands against every (receptor, grid box) target
     targets = load_docking_targets(setup)
-    cores = int(setup["cores"])
-    energy_range = setup.get("energy_range", "3")
+    options = load_vinalc_options(setup)
     mpirun_bin = None if args.no_mpirun else args.mpirun_bin
 
     for tdir in tranche_dirs:
         dock_tranche(
             tdir,
             targets,
-            energy_range=energy_range,
-            cores=cores,
+            options=options,
             vinalc_bin=args.vinalc_bin,
             mpirun_bin=mpirun_bin,
         )

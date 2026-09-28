@@ -37,6 +37,7 @@ import webview
 
 import io_parse
 import pipeline
+import resources
 
 REPO_ROOT = Path(__file__).resolve().parent
 
@@ -47,7 +48,7 @@ class TrancheProgress:
 
     label: str
     log_p: float
-    molecular_weight: int
+    size: str
     status: str = "PENDING"
     error: str | None = None
 
@@ -115,14 +116,68 @@ class PipelineAPI:
         result = self._window.create_file_dialog(webview.FOLDER_DIALOG)
         return result[0] if result else None
 
+    # ---- machine resources / CPU + memory budget ----
+
+    def detect_resources(self) -> dict[str, Any]:
+        """Specs of the machine the GUI (and so the pipeline) is running on, plus a suggested budget."""
+        try:
+            res = resources.detect_local()
+            return {"ok": True, "resources": res, "recommended": resources.recommend(res)}
+        except Exception as exc:
+            return {"ok": False, "message": str(exc)}
+
+    def load_server_report(self) -> dict[str, Any] | None:
+        """Pick a `server_check.sh` output file and size the run for that machine instead."""
+        path = self.browse_file()
+        if not path:
+            return None
+        try:
+            res = resources.parse_server_report(Path(path).read_text(errors="replace"))
+            res["source"] = f"server report ({Path(path).name})"
+            return {"ok": True, "resources": res, "recommended": resources.recommend(res)}
+        except Exception as exc:
+            return {"ok": False, "message": str(exc)}
+
+    def plan_budget(self, setup_path: str, cores: int, memory_gb: float | None) -> dict[str, Any]:
+        """What a core/memory budget means for VinaLC (ranks, per-rank memory), for live display."""
+        try:
+            return {"ok": True, **resources.plan(setup_path, int(cores), memory_gb)}
+        except Exception as exc:
+            return {"ok": False, "message": str(exc)}
+
+    def save_budget(self, setup_path: str, cores: int, memory_gb: float | None) -> dict[str, Any]:
+        """Write the chosen budget into setup.txt (`cores=`, `memory_gb=`), e.g. for a CLI run on the server."""
+        try:
+            resources.write_budget_to_setup(setup_path, int(cores), memory_gb)
+            return {"ok": True, "message": f"Saved cores={int(cores)}, memory_gb={memory_gb} to {setup_path}"}
+        except Exception as exc:
+            return {"ok": False, "message": str(exc)}
+
+    @staticmethod
+    def _load_setup_with_budget(setup_path: str, cores: int | None, memory_gb: float | None) -> dict[str, str]:
+        """setup.txt, with the GUI's core/memory budget (if one is set) taking precedence."""
+        setup = io_parse.load_setup(Path(setup_path))
+        if cores:
+            setup["cores"] = str(int(cores))
+        if memory_gb:
+            setup["memory_gb"] = str(memory_gb)
+        return setup
+
     # ---- validation (read-only, safe to call anytime) ----
 
-    def validate(self, setup_path: str, map_path: str, workdir: str) -> dict[str, Any]:
+    def validate(
+        self,
+        setup_path: str,
+        map_path: str,
+        workdir: str,
+        cores: int | None = None,
+        memory_gb: float | None = None,
+    ) -> dict[str, Any]:
         """Run the same checks `pipeline.py` runs before Stage 0, without starting anything."""
         try:
-            workdir_p = Path(workdir).expanduser()
+            workdir_p = Path(workdir).expanduser().resolve()
             workdir_p.mkdir(parents=True, exist_ok=True)
-            setup = io_parse.load_setup(Path(setup_path))
+            setup = self._load_setup_with_budget(setup_path, cores, memory_gb)
             tranches = io_parse.load_tranches_tsv(Path(map_path))
             io_parse.validate_inputs(setup, tranches, workdir_p)
             return {"ok": True, "message": io_parse.format_summary(setup, tranches, workdir_p)}
@@ -139,8 +194,14 @@ class PipelineAPI:
         vinalc_bin: str,
         mpirun_bin: str,
         no_mpirun: bool,
+        cores: int | None = None,
+        memory_gb: float | None = None,
     ) -> dict[str, Any]:
-        """Kick off a full pipeline run on a background thread; returns immediately."""
+        """Kick off a full pipeline run on a background thread; returns immediately.
+
+        `cores`/`memory_gb`, when given (from the Resources panel), override
+        setup.txt's values for this run only.
+        """
         with self._lock:
             if self._state.phase == "running":
                 return {"ok": False, "message": "A run is already in progress."}
@@ -148,7 +209,7 @@ class PipelineAPI:
 
         thread = threading.Thread(
             target=self._run,
-            args=(setup_path, map_path, workdir, vinalc_bin, mpirun_bin, no_mpirun),
+            args=(setup_path, map_path, workdir, vinalc_bin, mpirun_bin, no_mpirun, cores, memory_gb),
             daemon=True,
         )
         thread.start()
@@ -162,6 +223,8 @@ class PipelineAPI:
         vinalc_bin: str,
         mpirun_bin: str,
         no_mpirun: bool,
+        cores: int | None,
+        memory_gb: float | None,
     ) -> None:
         """The actual pipeline run, executed on a background thread.
 
@@ -174,18 +237,25 @@ class PipelineAPI:
         """
         state = self._state
         try:
-            workdir_p = Path(workdir).expanduser()
+            workdir_p = Path(workdir).expanduser().resolve()
             workdir_p.mkdir(parents=True, exist_ok=True)
 
-            setup = io_parse.load_setup(Path(setup_path))
+            setup = self._load_setup_with_budget(setup_path, cores, memory_gb)
             tranches = io_parse.load_tranches_tsv(Path(map_path))
             io_parse.validate_inputs(setup, tranches, workdir_p)
             targets = io_parse.load_docking_targets(setup)
+            options = io_parse.load_vinalc_options(setup)
 
             state.tranches = [
-                TrancheProgress(pipeline.tranche_label(t), t.log_p, t.molecular_weight) for t in tranches
+                TrancheProgress(pipeline.tranche_label(t), t.log_p, io_parse.tranche_size(t)) for t in tranches
             ]
             state.log_line(f"Loaded {len(tranches)} tranche(s).")
+            if "mpi_ranks" in setup:
+                state.log_line(f"Note: setup.txt sets mpi_ranks={setup['mpi_ranks']}, which overrides the CPU/memory budget.")
+            state.log_line(
+                f"Budget: cores={setup['cores']}, memory_gb={setup.get('memory_gb', 'unlimited')} "
+                f"-> mpirun -np {options.mpi_ranks}"
+            )
 
             (workdir_p / "tranches").mkdir(exist_ok=True)
             tdirs = []
@@ -194,8 +264,6 @@ class PipelineAPI:
                 tdirs.append(tdir)
                 prog.status = pipeline.read_status(tdir)
 
-            cores = int(setup["cores"])
-            energy_range = setup.get("energy_range", "3")
             filter_percent = float(setup["filter_percent"])
             mpirun = None if no_mpirun else mpirun_bin
 
@@ -213,8 +281,7 @@ class PipelineAPI:
                     pipeline.dock_tranche(
                         tdir,
                         targets,
-                        energy_range=energy_range,
-                        cores=cores,
+                        options=options,
                         vinalc_bin=vinalc_bin,
                         mpirun_bin=mpirun,
                     )
@@ -247,8 +314,8 @@ class PipelineAPI:
         for line in path.read_text().splitlines()[1:]:
             if not line.strip():
                 continue
-            lig, aff, tranche = line.split("\t")
-            rows.append({"ligand": lig, "affinity": float(aff), "tranche": tranche})
+            lig, aff, receptor, tranche = line.split("\t")
+            rows.append({"ligand": lig, "affinity": float(aff), "receptor": receptor, "tranche": tranche})
         return rows
 
     # ---- polling ----
@@ -264,7 +331,7 @@ class PipelineAPI:
                 {
                     "label": t.label,
                     "log_p": t.log_p,
-                    "molecular_weight": t.molecular_weight,
+                    "size": t.size,
                     "status": t.status,
                     "error": t.error,
                 }

@@ -8,6 +8,7 @@ underlying code.
 
 - [Glossary](#glossary)
 - [Quick start](#quick-start)
+- [Running on the docking server](#running-on-the-docking-server)
 - [Architecture](#architecture)
 - [Pipeline stages](#pipeline-stages-in-detail)
 - [CLI reference](#cli-reference)
@@ -57,13 +58,58 @@ show up throughout the config files and code:
 ## Quick start
 
 ```bash
-python3 pipeline.py --map tranches.txt --setup setup.txt --workdir ./run1
+python3 pipeline.py --map tranches.txt --setup setup.txt --workdir ./run1 \
+    --vinalc-bin tests/fixtures/mock_vinalc.py --no-mpirun
 ```
 
-This uses the placeholder receptor/ligand data checked into this repo, so
-it runs fully offline out of the box — see
+This uses the placeholder receptor/ligand data and the mock VinaLC checked
+into this repo, so it runs fully offline out of the box — see
 [Placeholders used for offline testing](#placeholders-used-for-offline-testing)
 before pointing it at a real screen.
+
+## Running on the docking server
+
+1. **Check the machine.** Copy the repo over and run
+   `bash server_check.sh /path/to/workdir 2>&1 | tee server_report.txt`.
+   It reports CPU cores (physical vs. hyperthreads), RAM, current load,
+   free disk space and inodes, Python, `vinalc`/`mpirun` (and an
+   `mpirun -np 2` smoke test), job schedulers, and whether ZINC is
+   reachable. It's read-only. Its last block (`DF_*=` lines) is what the
+   GUI's **Load server report** button reads.
+2. **Split the ZINC22 downloader into tranches.** CartBlanche22 gives one
+   file covering every tranche you picked:
+   ```bash
+   python3 zinc_split.py ZINC22-downloader-3D-pdbqt.tgz.curl --out-dir zinc22_scripts --map tranches.txt
+   ```
+   This writes one download script per tranche (e.g.
+   `zinc22_scripts/H04M000.curl`) and a `curl_script tranche` mapping
+   file.
+3. **Pick a CPU/memory budget** — either in the GUI's Resources panel (then
+   **Save to setup file**), or by editing `cores=` / `memory_gb=` in
+   `setup.txt` directly. See [CPU and memory](#cpu-and-memory).
+4. **Replace the placeholders** — a real prepared receptor in
+   `recList.txt`, and its grid box in `geoList.txt`.
+5. **Run**, detached so it survives logging out:
+   ```bash
+   nohup python3 pipeline.py --map tranches.txt --setup setup.txt --workdir /data/run1 \
+       --vinalc-bin /path/to/vinalc > run1.log 2>&1 &
+   ```
+   Re-running the same command resumes where it stopped.
+
+### CPU and memory
+
+VinaLC runs one master rank (hands out ligands) plus worker ranks, and each
+worker runs about `exhaustiveness` (default 8) search threads of its own.
+So `mpirun -np <cores>` would oversubscribe the machine ~8-fold. Instead
+the pipeline launches `cores // exhaustiveness` workers + 1 master (e.g.
+`cores=192` → `-np 25`).
+
+Each worker also builds a double-precision grid map per ligand atom type
+spanning the whole search box, so memory per worker grows with the box
+volume: roughly 0.8 GB for an 80 Å cube at the default 0.375 Å granularity
+(boxes of ~20–30 Å, typical for a known pocket, need far less). If
+`memory_gb` is set, the worker count is capped to fit that budget too.
+`mpi_ranks=` in setup.txt overrides both.
 
 ## Architecture
 
@@ -117,26 +163,34 @@ statuses don't count as "past" any stage.
    setup.txt used, for an audit trail. Safe to re-run — never overwrites an
    existing `status.txt` or `meta.txt`.
 2. **Stage 1 — download** (`download_tranche`): runs the tranche's
-   snapshotted curl script, then verifies at least one `*.pdbqt.gz` file
-   was produced. Logs stdout/stderr to `<tranche>/logs/download.*.log`.
-3. **Stage 2 — unpack** (`unpack_tranche`): decompresses every downloaded
-   `*.pdbqt.gz` into a flat `<tranche>/ligands/` directory and writes
-   `<tranche>/ligand_list.txt` (one ligand path per line) — this is the
-   file the docking stage feeds to the docking binary.
-4. **Stage 3 — dock** (`dock_tranche`): for every `(receptor, grid box)`
-   pair defined by `recList.txt`/`geoList.txt`, writes a vinalc-style
-   config (`build_vinalc_config`) and runs the docking binary — optionally
-   wrapped in `mpirun -np <cores>` — against the tranche's full ligand
-   list. Each target gets its own subdirectory under
-   `<tranche>/docking/target<i>_<receptor>/` so multi-target runs never
-   collide.
-5. **Stage 4 — rank + filter** (`rank_and_filter_tranche`): parses the
-   first `REMARK VINA RESULT:` line (the best pose — Vina/VinaLC always
-   list poses best-first) out of every docked `*_out.pdbqt` file, ranks
-   ligands ascending by affinity (most negative = best), and writes
-   `<tranche>/results/ranked_all.tsv` (everything) and
-   `<tranche>/results/top_hits.tsv` (top `filter_percent`%, at least 1
-   ligand).
+   snapshotted curl script, then verifies at least one ligand file
+   (`*.pdbqt.tgz`, `*.pdbqt.gz` or `*.pdbqt`) was produced. Logs
+   stdout/stderr to `<tranche>/logs/download.*.log`. If some commands fail
+   but others succeed (ZINC regularly 404s on individual archives), the
+   tranche continues and the failures are listed in
+   `<tranche>/download_failures.txt`.
+3. **Stage 2 — unpack** (`unpack_tranche`): reads every molecule out of
+   the downloads (ZINC22 `.pdbqt.tgz` archives hold one small pdbqt per
+   molecule) and writes them into `<tranche>/ligands/ligands_00001.pdbqt`
+   etc., 10,000 per file, **each wrapped in `MODEL`/`ENDMDL`**: VinaLC
+   treats each such block as one docking job and ignores anything outside
+   them. Also writes `ligand_list.txt` (VinaLC's `--ligList`) and
+   `ligand_index.tsv`, mapping VinaLC's `LIGAND <n>` numbering back to
+   ZINC ids. Unreadable downloads are skipped and listed in
+   `unpack_warnings.txt`.
+4. **Stage 3 — dock** (`dock_tranche`): one VinaLC run per tranche, from
+   `<tranche>/docking/`:
+   `mpirun -np <ranks> vinalc --recList recList.txt --ligList ligList.txt --geoList geoList.txt --exhaustiveness ... --num_modes ... --energy_range ...`.
+   VinaLC itself loops over every receptor × ligand. The exact command is
+   saved to `docking/command.txt`; results land in
+   `docking/recList.txt_ligList.txt.pdbqt.gz` (+ `.log.gz`).
+5. **Stage 4 — rank + filter** (`rank_and_filter_tranche`): streams
+   VinaLC's combined output (records arrive in completion order, labelled
+   only `LIGAND <n>`), takes each record's first `REMARK VINA RESULT:`
+   (poses are best-first), maps it back to a ZINC id, keeps each ligand's
+   best score across receptors, and writes `results/ranked_all.tsv`,
+   `results/top_hits.tsv` (top `filter_percent`%, at least 1 ligand) and
+   `results/summary.txt` (submitted vs. successfully docked).
 6. **Combine** (`combine_results`, run once per full pipeline invocation,
    not per-tranche): merges every tranche's `top_hits.tsv` into one
    workdir-level ranking at `workdir/results/top_hits_combined.tsv` — this
@@ -156,9 +210,9 @@ python3 pipeline.py --map <tranches.tsv> --setup <setup.txt> --workdir <dir> [op
 | `--only-stage0` | Stop after creating tranche workspaces (no downloads). |
 | `--only-download` | Stop after the download stage. |
 | `--only-unpack` | Stop after unpacking downloaded ligands. |
-| `--vinalc-bin PATH` | Docking binary to invoke (default `vinalc`). |
-| `--mpirun-bin PATH` | MPI launcher to wrap the docking binary with (default `mpirun`). |
-| `--no-mpirun` | Invoke the docking binary directly, skipping the MPI launcher. |
+| `--vinalc-bin PATH` | VinaLC binary (default `vinalc`, looked up on PATH; relative paths are fine). |
+| `--mpirun-bin PATH` | MPI launcher to wrap VinaLC with (default `mpirun`). |
+| `--no-mpirun` | Invoke the docking binary directly. Only for the test mock: real VinaLC exits unless it has at least 2 MPI ranks. |
 | `--clean` | Delete generated tranche outputs under the workdir; keeps the workdir itself. Does not require `--map`/`--setup` to be valid. |
 | `--nuke` | Delete the entire workdir. **Destructive and irreversible.** Does not require `--map`/`--setup` to be valid. |
 
@@ -190,6 +244,16 @@ python3 -m venv .venv
 - **Configuration panel** — set the setup file, tranches map, work
   directory, docking binary, and MPI launcher, with native file/folder
   pickers. Opens pre-filled with this repo's own `setup.txt`/`tranches.txt`.
+- **Resources panel** — shows the machine's physical/logical cores, RAM
+  and load, either **detected** (the machine the GUI runs on, done
+  automatically at startup) or from a **server report** (the output of
+  `server_check.sh`, for sizing a remote server from your laptop). Sliders
+  pick how many cores and how much RAM the run may use, pre-set to a
+  recommendation (physical cores minus current load and a ~5% reserve; 80%
+  of available RAM), and show live what that means: the `mpirun -np`,
+  estimated memory, and whether cores or memory is the limit. The budget
+  applies to Validate/Run from the GUI; **Save to setup file** writes it
+  as `cores=`/`memory_gb=` for CLI runs on the server.
 - **Validate** — runs the same checks `pipeline.py` runs before Stage 0,
   without downloading or docking anything.
 - **Run pipeline** — runs all stages on a background thread so the window
@@ -225,18 +289,26 @@ python3 -m venv .venv
   lines ignored):
   - `recList` — path to `recList.txt`.
   - `geoList` — path to `geoList.txt`.
-  - `ligList` — path to `ligList.txt`. Required to exist, but its contents
-    aren't consumed directly — per-tranche ligand lists are generated
-    automatically in Stage 2 from each tranche's downloaded ligands.
+  - `ligList` *(optional, unused)* — per-tranche ligand lists are
+    generated automatically in Stage 2.
   - `filter_percent` — number in `(0, 100]`; the top slice of ranked
     ligands to keep per tranche.
-  - `cores` — integer `>= 1`; degree of parallelism passed as
-    `mpirun -np <cores>`.
-  - `energy_range` *(optional)* — positive number; passed through to the
-    docking binary's config.
-- **`tranches.txt`** — TSV with header `curl_script log_p molecular_weight`,
-  one row per ZINC tranche. `curl_script` is resolved relative to this
-  file's own directory.
+  - `cores` — integer `>= 1`; CPU cores the run may use. See
+    [CPU and memory](#cpu-and-memory) for how this becomes `mpirun -np`.
+  - `memory_gb` *(optional)* — RAM budget; caps the number of VinaLC
+    workers.
+  - `energy_range` *(optional, default 3)*, `exhaustiveness` *(8)*,
+    `num_modes` *(9)*, `granularity` *(0.375)*, `seed` — passed to VinaLC
+    as the matching `--flags`.
+  - `mpi_ranks` *(optional)* — explicit `mpirun -np`, overriding
+    `cores`/`memory_gb`.
+
+  Relative paths are resolved against setup.txt's own directory.
+- **`tranches.txt`** — whitespace-separated, one row per tranche, with
+  header either `curl_script tranche` (ZINC22 codes like `H04M000`, as
+  written by `zinc_split.py`) or `curl_script log_p molecular_weight`
+  (older ZINC20-style). `curl_script` is resolved relative to this file's
+  own directory.
 - **`recList.txt`** — one receptor `.pdbqt` path per line, resolved
   relative to this file's own directory.
 - **`geoList.txt`** — one grid box per line, paired line-for-line with
@@ -247,23 +319,27 @@ python3 -m venv .venv
 ```
 <workdir>/
 ├── tranches/
-│   └── LP5_MW200/                    # one directory per tranche
+│   └── H04M000/                      # one directory per tranche
 │       ├── status.txt                # INIT | DOWNLOADED | UNPACKED | DOCKED | DONE | FAILED_*
-│       ├── meta.txt                  # creation time, log_p, molecular_weight
+│       ├── meta.txt                  # creation time, tranche, log_p, size bin
 │       ├── inputs/                   # snapshotted curl script + setup.txt
-│       ├── download/                 # raw *.pdbqt.gz, as downloaded
-│       ├── ligands/                  # decompressed *.pdbqt ligands
-│       ├── ligand_list.txt           # paths into ligands/, fed to the docking binary
+│       ├── download/                 # raw *.pdbqt.tgz, as downloaded
+│       ├── download_failures.txt     # download commands that failed (if any)
+│       ├── ligands/                  # ligands_00001.pdbqt ...: MODEL-wrapped molecules
+│       ├── ligand_list.txt           # paths into ligands/ (VinaLC --ligList)
+│       ├── ligand_index.tsv          # VinaLC "LIGAND <n>" -> ZINC id
+│       ├── unpack_warnings.txt       # unreadable downloads (if any)
 │       ├── docking/
-│       │   └── target1_protein/      # one dir per (receptor, grid box) target
-│       │       ├── vinalc.conf
-│       │       └── *_out.pdbqt       # docked poses + REMARK VINA RESULT scores
+│       │   ├── recList.txt, geoList.txt, ligList.txt, command.txt
+│       │   ├── recList.txt_ligList.txt.pdbqt.gz   # all poses + REMARK VINA RESULT scores
+│       │   └── recList.txt_ligList.txt.log.gz
 │       ├── logs/                     # stdout/stderr + timing for each subprocess call
 │       └── results/
-│           ├── ranked_all.tsv        # every docked ligand for this tranche, best-first
-│           └── top_hits.tsv          # top filter_percent% for this tranche
+│           ├── ranked_all.tsv        # ligand, affinity, receptor — best-first
+│           ├── top_hits.tsv          # top filter_percent% for this tranche
+│           └── summary.txt           # submitted vs. docked counts
 └── results/
-    └── top_hits_combined.tsv         # top hits across all tranches, merged + re-ranked
+    └── top_hits_combined.tsv         # ligand, affinity, receptor, tranche — merged + re-ranked
 ```
 
 ## Placeholders used for offline testing
@@ -272,17 +348,20 @@ Two files in this repo are intentionally placeholders so the pipeline runs
 end-to-end without network access or a real docking binary. **Replace both
 before running a real screen:**
 
-- **`ZINC-downloader-3D-pdbqt.gz.curl`** — synthesizes two tiny fake
-  ligands locally instead of hitting ZINC's servers. Replace with the real
-  curl-command file downloaded from the
-  [ZINC tranche picker](https://zinc20.docking.org).
+- **`ZINC-downloader-3D-pdbqt.gz.curl`** — synthesizes a tiny archive in
+  the real ZINC22 `.pdbqt.tgz` layout locally instead of hitting ZINC's
+  servers. For a real screen, run `zinc_split.py` on the downloader from
+  [CartBlanche22](https://cartblanche22.docking.org) and use the
+  `tranches.txt` it writes.
 - **`protein.pdbqt`** — a minimal placeholder receptor (a few bare CA
   atoms, not a real prepared structure). Replace with a real receptor
   prepared for docking (e.g. via AutoDockTools/MGLTools or Meeko).
 
 You'll also want to point `--vinalc-bin` (CLI) / "Docking binary" (GUI) at
-your actual VinaLC (or Vina/smina/QuickVina) install, rather than the
-`tests/fixtures/mock_vinalc.py` stand-in used by the automated tests.
+your actual VinaLC install, rather than the `tests/fixtures/mock_vinalc.py`
+stand-in used by the automated tests. The pipeline speaks VinaLC's command
+line and output format specifically; plain Vina/smina/QuickVina won't work
+without changing `build_vinalc_command` and `parse_vinalc_poses`.
 
 ## Testing
 
@@ -291,19 +370,27 @@ python3 -m unittest discover -s tests -v
 ```
 
 Tests run the full pipeline offline against `tests/fixtures/mock_vinalc.py`,
-a stand-in docking binary that writes deterministic fake affinities in the
-same output format (`REMARK VINA RESULT:` lines) that Vina/VinaLC produce,
-so the real parsing and ranking logic is exercised without needing MPI or a
-real docking install. Coverage includes: config parsing/validation edge
-cases, a full 5-stage run end-to-end, resumability (re-running a completed
-stage is a no-op), and the `--clean`/`--nuke` safety behavior.
+a stand-in that takes VinaLC's real flags and writes VinaLC's real output
+file and record format (out of order, `LIGAND <n>` labels) with
+deterministic fake affinities, so the real parsing and ranking logic is
+exercised without MPI or a real docking install.
+`tests/fixtures/H04M000-N-aaaaaa.pdbqt.tgz` is a real 4-molecule ZINC22
+archive. Coverage includes config parsing/validation, a full run
+end-to-end, resumability, partial download failures, ZINC22/ZINC20 unpack
+formats, `zinc_split.py`, CPU/memory planning and server-report parsing,
+and the `--clean`/`--nuke` safety behavior.
 
 ## Troubleshooting
 
-- **`FileNotFoundError: recList/geoList/ligList does not exist`** — these
-  paths in `setup.txt` are resolved as given (after `~` expansion), not
-  relative to `setup.txt`'s own directory. Use absolute paths, or paths
-  relative to wherever you run `pipeline.py`/`gui.py` from.
+- **`FileNotFoundError: recList/geoList does not exist`** — relative
+  paths in `setup.txt` are resolved against `setup.txt`'s own directory
+  (not the directory you launch from).
+- **Docking fails with `Error: Total process less than 2`** — VinaLC needs
+  at least 2 MPI ranks; don't use `--no-mpirun` with the real binary.
+- **`mpirun` refuses to start as root / "not enough slots"** — Open MPI
+  needs `--allow-run-as-root` as root, and may cap `-np` at the core count
+  it detects. `server_check.sh` runs an `mpirun -np 2` smoke test to catch
+  launcher problems before a real run.
 - **`geoList (...) and recList (...) must have the same number of lines`**
   — every receptor in `recList.txt` needs a matching grid box on the same
   line number in `geoList.txt`.

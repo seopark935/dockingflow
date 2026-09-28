@@ -242,6 +242,26 @@
     word-break: break-word;
   }
 
+  .config-card { overflow-y: auto; }
+
+  .specs {
+    font-size: 11.5px;
+    line-height: 1.5;
+    color: var(--text-dim);
+    background: var(--panel-2);
+    border: 1px solid var(--border);
+    border-radius: 6px;
+    padding: 8px 10px;
+    white-space: pre-wrap;
+  }
+
+  .specs b { color: var(--text); font-weight: 600; }
+  .specs .warn { color: var(--amber); }
+
+  .field label .val { float: right; color: var(--text); font-family: var(--mono); }
+
+  input[type="range"] { width: 100%; accent-color: var(--accent); }
+
   .log-panel { display: flex; flex-direction: column; min-height: 140px; flex: 0 0 160px; }
 
   .affinity-bar {
@@ -282,7 +302,7 @@
 <div class="grid">
 
   <!-- Left column: configuration -->
-  <div class="card">
+  <div class="card config-card">
     <h2>Configuration</h2>
 
     <div class="field">
@@ -328,6 +348,32 @@
 
     <div class="divider"></div>
 
+    <h2>Resources</h2>
+    <div class="btn-row">
+      <button class="small" onclick="detectResources()">Detect this machine</button>
+      <button class="small" onclick="loadServerReport()">Load server report&hellip;</button>
+    </div>
+    <div id="resSpecs" class="specs">Detecting&hellip;</div>
+
+    <div class="field">
+      <label>CPU cores to use <span class="val" id="coresVal"></span></label>
+      <input type="range" id="cores" min="1" max="1" step="1" oninput="onBudgetChange()" disabled>
+    </div>
+
+    <div class="field">
+      <label>Memory budget <span class="val" id="memVal"></span></label>
+      <input type="range" id="memory_gb" min="1" max="1" step="1" oninput="onBudgetChange()" disabled>
+    </div>
+
+    <div id="planOut" class="specs">Pick a machine above to size the run.</div>
+
+    <div class="btn-row">
+      <button class="small" id="recBtn" onclick="useRecommended()" disabled>Use recommended</button>
+      <button class="small" id="saveBudgetBtn" onclick="saveBudget()" disabled>Save to setup file</button>
+    </div>
+
+    <div class="divider"></div>
+
     <div class="btn-row">
       <button onclick="validate()">Validate</button>
       <button class="primary" id="runBtn" onclick="startRun()">Run pipeline</button>
@@ -348,7 +394,7 @@
       <div class="panel-scroll">
         <table>
           <thead>
-            <tr><th>Label</th><th>LogP</th><th>MW</th><th>Status</th><th>Error</th></tr>
+            <tr><th>Label</th><th>LogP</th><th>Size</th><th>Status</th><th>Error</th></tr>
           </thead>
           <tbody id="trancheRows">
             <tr><td colspan="5" class="empty-state">No run started yet.</td></tr>
@@ -367,10 +413,10 @@
       <div class="panel-scroll">
         <table>
           <thead>
-            <tr><th>Ligand</th><th>Affinity (kcal/mol)</th><th>Tranche</th></tr>
+            <tr><th>Ligand</th><th>Affinity (kcal/mol)</th><th>Receptor</th><th>Tranche</th></tr>
           </thead>
           <tbody id="resultRows">
-            <tr><td colspan="3" class="empty-state">Results appear here once a run finishes.</td></tr>
+            <tr><td colspan="4" class="empty-state">Results appear here once a run finishes.</td></tr>
           </tbody>
         </table>
       </div>
@@ -408,10 +454,108 @@ function currentConfig() {
   };
 }
 
+// ---- Resources: machine specs -> CPU/memory budget -> VinaLC rank plan ----
+
+let machine = null;      // specs of the machine being sized for
+let recommended = null;  // {cores, memory_gb, notes}
+let planTimer = null;
+
+const fmtGB = gb => gb == null ? '?' : (gb >= 100 ? gb.toFixed(0) : gb.toFixed(1)) + ' GB';
+
+// The budget sent with Validate/Run; nulls mean "use setup.txt as-is".
+function budget() {
+  if (!machine) return { cores: null, memory_gb: null };
+  return {
+    cores: parseInt(document.getElementById('cores').value, 10),
+    memory_gb: machine.mem_total_gb ? parseFloat(document.getElementById('memory_gb').value) : null,
+  };
+}
+
+function showMachine(res) {
+  if (!res) return;
+  if (!res.ok) { setBanner(res.message, 'err'); return; }
+  machine = res.resources;
+  recommended = res.recommended;
+  const m = machine;
+  const lines = [
+    `<b>${m.hostname}</b>  (${m.source})`,
+    `CPU: <b>${m.physical_cores}</b> physical cores, ${m.logical_cpus} logical` +
+      (m.load1 != null ? `, load ${m.load1.toFixed(1)}` : ''),
+    `RAM: <b>${fmtGB(m.mem_total_gb)}</b> total` +
+      (m.mem_available_gb != null ? `, ${fmtGB(m.mem_available_gb)} available` : ''),
+  ];
+  if (m.disk_free_gb != null) lines.push(`Disk free (workdir): ${fmtGB(m.disk_free_gb)}`);
+  lines.push(...recommended.notes.map(n => `<span class="warn">${n}</span>`));
+  document.getElementById('resSpecs').innerHTML = lines.join('\n');
+
+  const cores = document.getElementById('cores');
+  cores.max = m.logical_cpus;
+  cores.disabled = false;
+
+  const mem = document.getElementById('memory_gb');
+  if (m.mem_total_gb) {
+    mem.max = Math.max(1, Math.floor(m.mem_total_gb));
+    mem.disabled = false;
+  } else {
+    mem.disabled = true;
+  }
+  document.getElementById('recBtn').disabled = false;
+  document.getElementById('saveBudgetBtn').disabled = false;
+  useRecommended();
+}
+
+function useRecommended() {
+  if (!recommended) return;
+  document.getElementById('cores').value = recommended.cores;
+  if (recommended.memory_gb != null) document.getElementById('memory_gb').value = Math.floor(recommended.memory_gb);
+  onBudgetChange();
+}
+
+function onBudgetChange() {
+  const b = budget();
+  document.getElementById('coresVal').textContent = `${b.cores} / ${machine.logical_cpus}`;
+  document.getElementById('memVal').textContent =
+    b.memory_gb != null ? `${b.memory_gb} / ${Math.floor(machine.mem_total_gb)} GB` : 'unknown';
+  clearTimeout(planTimer);
+  planTimer = setTimeout(refreshPlan, 150);
+}
+
+async function refreshPlan() {
+  const b = budget();
+  const out = document.getElementById('planOut');
+  const p = await pywebview.api.plan_budget(fieldVal('setup_path'), b.cores, b.memory_gb);
+  if (!p.ok) { out.textContent = `Can't plan yet: ${p.message}`; return; }
+  const lines = [
+    `VinaLC: <b>mpirun -np ${p.mpi_ranks}</b>  (1 master + ${p.workers} workers x ~${p.exhaustiveness} threads)`,
+    `Est. memory: <b>${fmtGB(p.est_memory_gb)}</b>  (~${fmtGB(p.rank_memory_gb)} per worker for your grid box)`,
+    `Limited by: ${p.limited_by}`,
+  ];
+  if (b.cores > machine.physical_cores)
+    lines.push('<span class="warn">More cores than physical cores: hyperthreads add little for Vina.</span>');
+  if (machine.mem_available_gb != null && p.est_memory_gb > machine.mem_available_gb)
+    lines.push('<span class="warn">Estimate exceeds currently available RAM.</span>');
+  out.innerHTML = lines.join('\n');
+}
+
+async function detectResources() {
+  showMachine(await pywebview.api.detect_resources());
+}
+
+async function loadServerReport() {
+  showMachine(await pywebview.api.load_server_report());
+}
+
+async function saveBudget() {
+  const b = budget();
+  const res = await pywebview.api.save_budget(fieldVal('setup_path'), b.cores, b.memory_gb);
+  setBanner(res.message, res.ok ? 'ok' : 'err');
+}
+
 async function validate() {
   const c = currentConfig();
+  const b = budget();
   setBanner('Validating...', 'info');
-  const res = await pywebview.api.validate(c.setup_path, c.map_path, c.workdir);
+  const res = await pywebview.api.validate(c.setup_path, c.map_path, c.workdir, b.cores, b.memory_gb);
   setBanner(res.message, res.ok ? 'ok' : 'err');
 }
 
@@ -421,8 +565,9 @@ async function startRun() {
   runBtn.disabled = true;
   setBanner('Starting run...', 'info');
 
+  const b = budget();
   const res = await pywebview.api.start_run(
-    c.setup_path, c.map_path, c.workdir, c.vinalc_bin, c.mpirun_bin, c.no_mpirun
+    c.setup_path, c.map_path, c.workdir, c.vinalc_bin, c.mpirun_bin, c.no_mpirun, b.cores, b.memory_gb
   );
   if (!res.ok) {
     setBanner(res.message, 'err');
@@ -457,7 +602,7 @@ function renderTranches(rows) {
     <tr>
       <td>${t.label}</td>
       <td>${t.log_p}</td>
-      <td>${t.molecular_weight}</td>
+      <td>${t.size}</td>
       <td><span class="badge ${t.status}">${t.status}</span></td>
       <td style="color: var(--red); font-family: var(--sans); font-size: 11px;">${t.error || ''}</td>
     </tr>
@@ -467,7 +612,7 @@ function renderTranches(rows) {
 function renderResults(rows) {
   const tbody = document.getElementById('resultRows');
   if (!rows.length) {
-    tbody.innerHTML = '<tr><td colspan="3" class="empty-state">Results appear here once a run finishes.</td></tr>';
+    tbody.innerHTML = '<tr><td colspan="4" class="empty-state">Results appear here once a run finishes.</td></tr>';
     return;
   }
   const best = Math.min(...rows.map(r => r.affinity));
@@ -480,6 +625,7 @@ function renderResults(rows) {
       <tr>
         <td>${r.ligand}</td>
         <td>${r.affinity.toFixed(3)}<span class="affinity-bar" style="width:${width}px"></span></td>
+        <td>${r.receptor}</td>
         <td>${r.tranche}</td>
       </tr>
     `;
@@ -524,6 +670,7 @@ window.addEventListener('pywebviewready', async () => {
   document.getElementById('workdir').value = d.workdir;
   document.getElementById('vinalc_bin').value = d.vinalc_bin;
   document.getElementById('mpirun_bin').value = d.mpirun_bin;
+  detectResources();
 });
 </script>
 
