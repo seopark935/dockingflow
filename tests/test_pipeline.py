@@ -7,7 +7,11 @@ Run with: python3 -m unittest discover -s tests -v
 from __future__ import annotations
 
 import gzip
+import json
 import shutil
+import threading
+import urllib.error
+import urllib.request
 import subprocess
 import sys
 import tempfile
@@ -20,6 +24,7 @@ sys.path.insert(0, str(REPO_ROOT))
 import io_parse
 import pipeline
 import resources
+import web_server
 import zinc_split
 
 MOCK_VINALC = REPO_ROOT / "tests" / "fixtures" / "mock_vinalc.py"
@@ -310,6 +315,75 @@ class ZincSplitTest(unittest.TestCase):
         self.assertEqual([io_parse.tranche_label(t) for t in tranches], ["H04M000", "H17P050"])
         self.assertEqual((tranches[1].heavy_atoms, tranches[1].log_p), (17, 0.5))
         self.assertEqual((tmp / "scripts" / "H04M000.curl").read_text().count("curl --fail"), 2)
+
+
+class WebServerTest(unittest.TestCase):
+    """The HTTP layer behind `gui.py --web` (the GUI on a headless server)."""
+
+    class FakeAPI:
+        def get_defaults(self):
+            return {"workdir": "/x"}
+
+        def add(self, a, b):
+            return a + b
+
+        def nuke(self, workdir):
+            return {"ok": True}
+
+        def set_window(self, w):
+            return None
+
+        def _run(self):
+            return None
+
+    def setUp(self):
+        from http.server import ThreadingHTTPServer
+
+        self.token = "secret-token"
+        handler = web_server.make_handler(self.FakeAPI(), REPO_ROOT / "gui_assets" / "index.html", self.token)
+        self.server = ThreadingHTTPServer(("127.0.0.1", 0), handler)
+        threading.Thread(target=self.server.serve_forever, daemon=True).start()
+        self.addCleanup(self.server.server_close)
+        self.addCleanup(self.server.shutdown)
+        self.base = f"http://127.0.0.1:{self.server.server_address[1]}"
+
+    def _post(self, method, args, token="secret-token"):
+        req = urllib.request.Request(
+            f"{self.base}/api/{method}", data=json.dumps(args).encode(), method="POST",
+            headers={web_server.TOKEN_HEADER: token},
+        )
+        try:
+            with urllib.request.urlopen(req) as r:
+                return r.status, json.load(r)
+        except urllib.error.HTTPError as e:
+            with e:
+                return e.code, json.load(e)
+
+    def test_page_is_served_in_web_mode(self):
+        with urllib.request.urlopen(self.base + "/?token=abc") as r:
+            self.assertIn("window.DF_WEB = true;</script>", r.read().decode())
+
+    def test_api_call_with_token(self):
+        self.assertEqual(self._post("add", [2, 3]), (200, 5))
+        self.assertEqual(self._post("get_defaults", []), (200, {"workdir": "/x"}))
+
+    def test_api_rejects_missing_or_wrong_token(self):
+        self.assertEqual(self._post("nuke", ["/x"], token="")[0], 403)
+        self.assertEqual(self._post("nuke", ["/x"], token="guess")[0], 403)
+
+    def test_private_and_desktop_only_methods_not_exposed(self):
+        self.assertEqual(self._post("_run", [])[0], 404)
+        self.assertEqual(self._post("set_window", [None])[0], 404)
+
+    def test_list_dir_for_in_page_picker(self):
+        import gui
+
+        res = gui.PipelineAPI().list_dir(str(REPO_ROOT / "setup.txt"))  # a file lists its directory
+        self.assertTrue(res["ok"])
+        self.assertEqual(Path(res["path"]), REPO_ROOT)
+        names = [e["name"] for e in res["entries"]]
+        self.assertIn("setup.txt", names)
+        self.assertTrue(res["entries"][0]["is_dir"])  # directories first
 
 
 if __name__ == "__main__":

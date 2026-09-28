@@ -2,3 +2,6 @@ __pycache__/
 *.pyc
 .venv/
 /run/
+.gui_server.pid
+gui_server.log
+server_report.txt

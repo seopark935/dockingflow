@@ -262,6 +262,29 @@
 
   input[type="range"] { width: 100%; accent-color: var(--accent); }
 
+  /* In-page file picker (web mode, where there are no native dialogs) */
+  .modal {
+    position: fixed; inset: 0;
+    background: rgba(0, 0, 0, 0.55);
+    display: flex; align-items: center; justify-content: center;
+    z-index: 10;
+  }
+  .modal.hidden { display: none; }
+  .modal-box {
+    width: min(640px, 92vw); max-height: 80vh;
+    background: var(--panel); border: 1px solid var(--border); border-radius: 10px;
+    padding: 16px; display: flex; flex-direction: column; gap: 10px;
+  }
+  .picker-list {
+    overflow-y: auto; min-height: 200px; flex: 1;
+    background: var(--panel-2); border: 1px solid var(--border); border-radius: 6px;
+    font-family: var(--mono); font-size: 12px;
+  }
+  .picker-list div { padding: 5px 10px; cursor: pointer; }
+  .picker-list div:hover { background: var(--border); }
+  .picker-list .dir { color: var(--accent); }
+  .picker-list .file.disabled { color: var(--text-dim); cursor: default; }
+
   .log-panel { display: flex; flex-direction: column; min-height: 140px; flex: 0 0 160px; }
 
   .affinity-bar {
@@ -425,8 +448,32 @@
   </div>
 </div>
 
+<div id="picker" class="modal hidden">
+  <div class="modal-box">
+    <h2 id="pickerTitle">Choose a file</h2>
+    <div class="row">
+      <input type="text" id="pickerPath" onkeydown="if (event.key === 'Enter') pickerGo()">
+      <button class="small" onclick="pickerGo()">Go</button>
+    </div>
+    <div id="pickerList" class="picker-list"></div>
+    <div class="btn-row">
+      <button class="small" onclick="pickerUp()">Up</button>
+      <span style="flex: 1"></span>
+      <button class="small" onclick="pickerClose(null)">Cancel</button>
+      <button class="small primary" id="pickerSelect" onclick="pickerClose(pickerState.path)">Select this folder</button>
+    </div>
+  </div>
+</div>
+
 <script>
 let polling = null;
+
+// The backend API: pywebview's js_api in the desktop app, or the HTTP shim
+// (DF_WEB_API, defined at the bottom) when served by web_server.py. Looked
+// up through this function rather than window.pywebview so a pywebview
+// window that's merely *viewing* the web server can't shadow the shim.
+let DF_WEB_API = null;
+function api() { return window.DF_WEB ? DF_WEB_API : window.pywebview.api; }
 
 function setBanner(text, kind) {
   const el = document.getElementById('banner');
@@ -437,10 +484,61 @@ function setBanner(text, kind) {
 function fieldVal(id) { return document.getElementById(id).value.trim(); }
 
 async function browse(fieldId, kind) {
-  const path = kind === 'folder'
-    ? await pywebview.api.browse_folder()
-    : await pywebview.api.browse_file();
+  let path;
+  if (window.DF_WEB) {
+    path = await pickPath(kind, fieldVal(fieldId));
+  } else {
+    path = kind === 'folder'
+      ? await api().browse_folder()
+      : await api().browse_file();
+  }
   if (path) document.getElementById(fieldId).value = path;
+}
+
+// ---- In-page file picker (web mode): browses the server's filesystem ----
+
+let pickerState = { kind: 'file', path: '', resolve: null };
+
+function pickPath(kind, start) {
+  pickerState.kind = kind;
+  document.getElementById('pickerTitle').textContent = kind === 'folder' ? 'Choose a folder' : 'Choose a file';
+  document.getElementById('pickerSelect').style.display = kind === 'folder' ? '' : 'none';
+  document.getElementById('picker').classList.remove('hidden');
+  pickerLoad(start || '');
+  return new Promise(resolve => { pickerState.resolve = resolve; });
+}
+
+async function pickerLoad(path) {
+  const res = await api().list_dir(path);
+  const list = document.getElementById('pickerList');
+  if (!res.ok) { list.textContent = res.message; return; }
+  pickerState.path = res.path;
+  pickerState.parent = res.parent;
+  document.getElementById('pickerPath').value = res.path;
+  list.replaceChildren(...res.entries.map(e => {
+    const row = document.createElement('div');
+    row.textContent = e.is_dir ? `${e.name}/` : e.name;
+    const full = `${res.path.replace(/\/$/, '')}/${e.name}`;
+    if (e.is_dir) {
+      row.className = 'dir';
+      row.onclick = () => pickerLoad(full);
+    } else if (pickerState.kind === 'file') {
+      row.className = 'file';
+      row.onclick = () => pickerClose(full);
+    } else {
+      row.className = 'file disabled';
+    }
+    return row;
+  }));
+}
+
+function pickerGo() { pickerLoad(document.getElementById('pickerPath').value.trim()); }
+function pickerUp() { pickerLoad(pickerState.parent); }
+
+function pickerClose(path) {
+  document.getElementById('picker').classList.add('hidden');
+  if (pickerState.resolve) pickerState.resolve(path);
+  pickerState.resolve = null;
 }
 
 function currentConfig() {
@@ -523,7 +621,7 @@ function onBudgetChange() {
 async function refreshPlan() {
   const b = budget();
   const out = document.getElementById('planOut');
-  const p = await pywebview.api.plan_budget(fieldVal('setup_path'), b.cores, b.memory_gb);
+  const p = await api().plan_budget(fieldVal('setup_path'), b.cores, b.memory_gb);
   if (!p.ok) { out.textContent = `Can't plan yet: ${p.message}`; return; }
   const lines = [
     `VinaLC: <b>mpirun -np ${p.mpi_ranks}</b>  (1 master + ${p.workers} workers x ~${p.exhaustiveness} threads)`,
@@ -538,16 +636,21 @@ async function refreshPlan() {
 }
 
 async function detectResources() {
-  showMachine(await pywebview.api.detect_resources());
+  showMachine(await api().detect_resources());
 }
 
 async function loadServerReport() {
-  showMachine(await pywebview.api.load_server_report());
+  if (window.DF_WEB) {
+    const path = await pickPath('file', fieldVal('setup_path'));
+    if (path) showMachine(await api().load_server_report(path));
+  } else {
+    showMachine(await api().load_server_report());
+  }
 }
 
 async function saveBudget() {
   const b = budget();
-  const res = await pywebview.api.save_budget(fieldVal('setup_path'), b.cores, b.memory_gb);
+  const res = await api().save_budget(fieldVal('setup_path'), b.cores, b.memory_gb);
   setBanner(res.message, res.ok ? 'ok' : 'err');
 }
 
@@ -555,7 +658,7 @@ async function validate() {
   const c = currentConfig();
   const b = budget();
   setBanner('Validating...', 'info');
-  const res = await pywebview.api.validate(c.setup_path, c.map_path, c.workdir, b.cores, b.memory_gb);
+  const res = await api().validate(c.setup_path, c.map_path, c.workdir, b.cores, b.memory_gb);
   setBanner(res.message, res.ok ? 'ok' : 'err');
 }
 
@@ -566,7 +669,7 @@ async function startRun() {
   setBanner('Starting run...', 'info');
 
   const b = budget();
-  const res = await pywebview.api.start_run(
+  const res = await api().start_run(
     c.setup_path, c.map_path, c.workdir, c.vinalc_bin, c.mpirun_bin, c.no_mpirun, b.cores, b.memory_gb
   );
   if (!res.ok) {
@@ -581,14 +684,14 @@ async function startRun() {
 async function cleanWorkdir() {
   const c = currentConfig();
   if (!confirm(`Delete generated tranche outputs under:\n${c.workdir}\n\nThe workdir itself is kept.`)) return;
-  const res = await pywebview.api.clean(c.workdir);
+  const res = await api().clean(c.workdir);
   setBanner(res.ok ? 'Cleaned tranche outputs.' : res.message, res.ok ? 'ok' : 'err');
 }
 
 async function nukeWorkdir() {
   const c = currentConfig();
   if (!confirm(`DELETE THE ENTIRE WORKDIR:\n${c.workdir}\n\nThis cannot be undone. Continue?`)) return;
-  const res = await pywebview.api.nuke(c.workdir);
+  const res = await api().nuke(c.workdir);
   setBanner(res.ok ? 'Workdir deleted.' : res.message, res.ok ? 'ok' : 'err');
 }
 
@@ -640,7 +743,14 @@ function renderLog(lines) {
 }
 
 async function pollStatus() {
-  const s = await pywebview.api.get_status();
+  let s;
+  try {
+    s = await api().get_status();
+  } catch (e) {
+    setBanner('Lost connection to the DockingFlow server (SSH tunnel closed?). ' +
+              'Any run keeps going on the server; reconnect and reload this page.', 'err');
+    return;
+  }
   renderTranches(s.tranches);
   renderResults(s.top_hits);
   renderLog(s.log);
@@ -663,15 +773,51 @@ async function pollStatus() {
   }
 }
 
+let initialized = false;
 window.addEventListener('pywebviewready', async () => {
-  const d = await pywebview.api.get_defaults();
+  if (initialized) return;  // pywebview can fire this again when viewing the web server
+  initialized = true;
+  const d = await api().get_defaults();
   document.getElementById('setup_path').value = d.setup_path;
   document.getElementById('map_path').value = d.map_path;
   document.getElementById('workdir').value = d.workdir;
   document.getElementById('vinalc_bin').value = d.vinalc_bin;
   document.getElementById('mpirun_bin').value = d.mpirun_bin;
   detectResources();
+
+  // Reopening the page (web mode) while a run is in progress: pick it back up.
+  const s = await api().get_status();
+  if (s.phase !== 'idle') {
+    document.getElementById('runBtn').disabled = s.phase === 'running';
+    if (s.phase === 'running') setBanner('A run is in progress on this machine; showing its live status.', 'info');
+    pollStatus();
+    if (s.phase === 'running' && !polling) polling = setInterval(pollStatus, 700);
+  }
 });
+
+// ---- Web mode (gui.py --web): route pywebview.api calls over HTTP ----
+// In the desktop app, pywebview provides window.pywebview itself and fires
+// 'pywebviewready'. Served by web_server.py, the page instead gets
+// window.DF_WEB = true and this shim, which POSTs each call to
+// /api/<method> with the access token from the page URL, then fires
+// 'pywebviewready' itself.
+if (window.DF_WEB) {
+  const token = new URLSearchParams(location.search).get('token') || '';
+  DF_WEB_API = new Proxy({}, {
+      get: (_, name) => async (...args) => {
+        const r = await fetch(`/api/${name}`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json', 'X-DockingFlow-Token': token },
+          body: JSON.stringify(args),
+        });
+        const body = await r.json().catch(() => ({ ok: false, message: `HTTP ${r.status}` }));
+        if (r.status === 403) setBanner(body.message, 'err');
+        return body;
+      },
+  });
+  document.title = `DockingFlow (${location.host})`;
+  window.dispatchEvent(new Event('pywebviewready'));
+}
 </script>
 
 </body>

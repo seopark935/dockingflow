@@ -69,6 +69,36 @@ before pointing it at a real screen.
 
 ## Running on the docking server
 
+### With the GUI (recommended; e.g. from MobaXterm)
+
+1. SSH into the server with MobaXterm (X11-Forwarding is on by default in
+   MobaXterm SSH sessions), `cd` into this repo, and run:
+   ```bash
+   bash gui.sh
+   ```
+   A DockingFlow window opens on your own screen. Everything in it —
+   machine detection, file browsing, downloads, docking — happens on the
+   server.
+2. In the window: Browse to your setup file / tranche map / workdir, pick
+   CPU and memory with the Resources sliders (pre-set to a recommendation
+   for this server), Validate, then Run pipeline.
+3. Close the window or MobaXterm whenever you like: the run keeps going on
+   the server. Run `bash gui.sh` again later to reopen the window and see
+   live progress. `bash gui.sh stop` stops the GUI server (and any run in
+   progress — re-running resumes where it stopped).
+
+How it works: `gui.sh` starts `gui.py --web` detached in the background (it
+owns the run; log in `gui_server.log`) and then opens a window onto it
+through MobaXterm's X server — using a browser installed on the server
+(Chromium/Chrome/Firefox), or, if there is none, a small built-in window
+that `bash gui.sh setup` installs once (pywebview + Qt into `.venv`, no
+admin rights needed). If no window can be opened, `gui.sh` prints how to
+reach the GUI from your own browser through a MobaXterm SSH tunnel
+instead. The web server listens on localhost only and requires the random
+token in its URL, so other users on a shared server can't control it.
+
+### With the command line
+
 1. **Check the machine.** Copy the repo over and run
    `bash server_check.sh /path/to/workdir 2>&1 | tee server_report.txt`.
    It reports CPU cores (physical vs. hyperthreads), RAM, current load,
@@ -222,22 +252,20 @@ A desktop app (not a browser tab) built with [pywebview](https://pywebview.flowr
 Python hosts the pipeline logic and exposes it to a bundled HTML/CSS/JS page
 rendered in a native window.
 
-### Setup
-
-pywebview isn't in the standard library and this machine's Python is an
-externally-managed Homebrew install, so it's kept in a project-local
-virtual environment rather than installed system-wide:
-
-```bash
-python3 -m venv .venv
-.venv/bin/pip install pywebview
-```
-
 ### Running
 
-```bash
-.venv/bin/python3 gui.py
-```
+- **On the docking server:** `bash gui.sh` — see
+  [Running on the docking server](#with-the-gui-recommended-eg-from-mobaxterm).
+  Needs nothing beyond Python's standard library on the server (plus a
+  browser, or `bash gui.sh setup`, for the window).
+- **As a local desktop app** (runs the pipeline on this machine):
+  ```bash
+  python3 -m venv .venv
+  .venv/bin/pip install pywebview
+  .venv/bin/python3 gui.py
+  ```
+- **Web mode by hand:** `python3 gui.py --web [--port 8765]` prints an SSH
+  tunnel command and a `http://localhost:8765/?token=...` URL.
 
 ### What it does
 
@@ -275,8 +303,11 @@ python3 -m venv .venv
   [Architecture](#architecture) for the one intentional behavioral
   difference (per-tranche failure isolation).
 - The frontend (`gui_assets/index.html`) is a single self-contained file:
-  no external network requests, no CDN dependencies, no build step — it's
-  loaded straight off disk by pywebview.
+  no external network requests, no CDN dependencies, no build step. The
+  same page runs in both modes: in the desktop app it calls
+  `pywebview.api`; served by `web_server.py` it gets `window.DF_WEB = true`
+  and routes the same calls over HTTP (`POST /api/<method>`), with an
+  in-page file picker (`PipelineAPI.list_dir`) replacing native dialogs.
 - There's no push channel from Python to JS by design; the frontend polls
   `get_status()` on an interval. This keeps the threading model simple (one
   writer thread — the run thread — one reader — the poll loop) at the cost

@@ -1,18 +1,23 @@
 #!/usr/bin/env python3
-"""DockingFlow desktop GUI.
+"""DockingFlow GUI: a desktop window, or a web page served from the docking server.
 
-This module wraps the existing, unmodified pipeline (`pipeline.py` /
-`io_parse.py`) in a small desktop application so a run can be configured and
-watched without touching a terminal.
+This module wraps the existing pipeline (`pipeline.py` / `io_parse.py`) in a
+small app so a run can be configured and watched without touching a
+terminal. It runs in one of two modes, sharing the same frontend
+(`gui_assets/index.html`) and the same `PipelineAPI`:
+
+  - Desktop (`python3 gui.py`): `pywebview` hosts the page in a native OS
+    window and exposes `PipelineAPI` as the window's `js_api`; the frontend
+    calls `pywebview.api.<method>(...)`, which pywebview marshals to/from
+    JSON.
+  - Web (`python3 gui.py --web`): for a headless server. `web_server.py`
+    serves the page and a JSON endpoint per `PipelineAPI` method on
+    localhost, and a small shim in the page routes the same
+    `pywebview.api.<method>(...)` calls over HTTP. View it from a laptop
+    through an SSH tunnel. Standard library only — pywebview isn't needed.
 
 Architecture
 ------------
-`pywebview` hosts a single HTML/CSS/JS page (`gui_assets/index.html`) inside a
-native OS window. Python exposes a `PipelineAPI` instance as the window's
-`js_api`; the frontend calls its methods as `pywebview.api.<method>(...)`,
-which pywebview marshals to/from JSON automatically (Python dicts/lists/
-primitives <-> JS objects/arrays/values).
-
 The actual docking pipeline runs on a background thread (`PipelineAPI._run`)
 so the window stays responsive while downloads/docking are in progress. The
 frontend polls `get_status()` every ~700ms and re-renders; there is no push
@@ -27,13 +32,13 @@ GUI favors showing partial progress over an all-or-nothing run.
 """
 from __future__ import annotations
 
+import argparse
+import os
 import threading
 import traceback
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
-
-import webview
 
 import io_parse
 import pipeline
@@ -86,9 +91,9 @@ class PipelineAPI:
     def __init__(self) -> None:
         self._lock = threading.Lock()
         self._state = RunState()
-        self._window: webview.Window | None = None
+        self._window: Any = None  # webview.Window, desktop mode only
 
-    def set_window(self, window: webview.Window) -> None:
+    def set_window(self, window: Any) -> None:
         """Wired up once, right after the window is created, for file dialogs."""
         self._window = window
 
@@ -105,16 +110,46 @@ class PipelineAPI:
         }
 
     def browse_file(self) -> str | None:
+        """Native file dialog (desktop mode). The web frontend uses `list_dir` instead."""
         if not self._window:
             return None
+        import webview
+
         result = self._window.create_file_dialog(webview.OPEN_DIALOG)
         return result[0] if result else None
 
     def browse_folder(self) -> str | None:
+        """Native folder dialog (desktop mode). The web frontend uses `list_dir` instead."""
         if not self._window:
             return None
+        import webview
+
         result = self._window.create_file_dialog(webview.FOLDER_DIALOG)
         return result[0] if result else None
+
+    def list_dir(self, path: str) -> dict[str, Any]:
+        """Directory listing for the web frontend's in-page file picker.
+
+        `path` may be a file (lists its directory) or empty (lists the repo).
+        """
+        try:
+            p = Path(path).expanduser() if path else REPO_ROOT
+            if not p.is_absolute():
+                p = REPO_ROOT / p
+            p = p.resolve()
+            while not p.is_dir():  # a file, or a path that doesn't exist yet
+                p = p.parent
+            entries = []
+            with os.scandir(p) as it:
+                for e in it:
+                    try:
+                        entries.append({"name": e.name, "is_dir": e.is_dir()})
+                    except OSError:
+                        continue
+            entries.sort(key=lambda e: (not e["is_dir"], e["name"].startswith("."), e["name"].lower()))
+            return {"ok": True, "path": str(p), "parent": str(p.parent), "entries": entries}
+        except Exception as exc:
+            return {"ok": False, "message": str(exc)}
 
     # ---- machine resources / CPU + memory budget ----
 
@@ -126,9 +161,13 @@ class PipelineAPI:
         except Exception as exc:
             return {"ok": False, "message": str(exc)}
 
-    def load_server_report(self) -> dict[str, Any] | None:
-        """Pick a `server_check.sh` output file and size the run for that machine instead."""
-        path = self.browse_file()
+    def load_server_report(self, path: str | None = None) -> dict[str, Any] | None:
+        """Size the run from a `server_check.sh` output file instead of this machine.
+
+        `path` comes from the web frontend's picker; in desktop mode it's
+        omitted and a native file dialog is shown.
+        """
+        path = path or self.browse_file()
         if not path:
             return None
         try:
@@ -358,8 +397,46 @@ class PipelineAPI:
 
 
 def main() -> None:
+    parser = argparse.ArgumentParser(description="DockingFlow GUI")
+    parser.add_argument(
+        "--web", action="store_true",
+        help="Serve the GUI as a web page (for a headless server) instead of opening a desktop window",
+    )
+    parser.add_argument("--port", type=int, default=8765, help="Web mode: port to listen on (default 8765)")
+    parser.add_argument(
+        "--host", default="127.0.0.1",
+        help="Web mode: address to bind (default 127.0.0.1, reachable only through an SSH tunnel)",
+    )
+    parser.add_argument(
+        "--viewer", metavar="URL",
+        help="Open a desktop window showing an already-running web GUI (used by gui.sh over X11)",
+    )
+    args = parser.parse_args()
+
+    if args.viewer:
+        # Just a window onto the web server: closing it never stops a run,
+        # because the run lives in the server process. Remote X11 displays
+        # (e.g. MobaXterm) rarely support GPU rendering, so turn it off.
+        os.environ.setdefault("QTWEBENGINE_CHROMIUM_FLAGS", "--disable-gpu")
+        os.environ.setdefault("WEBKIT_DISABLE_COMPOSITING_MODE", "1")
+        import webview
+
+        webview.create_window("DockingFlow", args.viewer, width=1200, height=820, min_size=(860, 600),
+                              background_color="#0f1115")
+        webview.start()
+        return
+
     api = PipelineAPI()
     html_path = REPO_ROOT / "gui_assets" / "index.html"
+
+    if args.web:
+        import web_server
+
+        web_server.serve(api, html_path, host=args.host, port=args.port)
+        return
+
+    import webview
+
     window = webview.create_window(
         "DockingFlow",
         str(html_path),

@@ -79,6 +79,20 @@ else
 fi
 [ "$(id -u)" = 0 ] && echo "NOTE: running as root -- Open MPI needs --allow-run-as-root"
 
+section "GUI display (bash gui.sh)"
+if [ -n "$DISPLAY" ]; then
+    echo "X11 forwarding: ON (DISPLAY=$DISPLAY) -- gui.sh can open a window on your screen"
+else
+    echo "X11 forwarding: OFF -- in MobaXterm enable SSH > Advanced SSH settings > X11-Forwarding"
+fi
+found_browser=""
+for b in chromium chromium-browser google-chrome google-chrome-stable firefox; do
+    have "$b" && { echo "browser: $b -> $(command -v $b)"; found_browser=1; }
+done
+[ -z "$found_browser" ] && echo "browser: none (run 'bash gui.sh setup' for a small built-in window)"
+[ -x .venv/bin/python3 ] && .venv/bin/python3 -c "import webview" 2>/dev/null \
+    && echo "pywebview window: installed (.venv)"
+
 section "Network access to ZINC"
 curl -s -m 20 -o /dev/null -w 'files.docking.org -> HTTP %{http_code} in %{time_total}s\n' \
     https://files.docking.org/zinc22/ || echo "cannot reach files.docking.org"
