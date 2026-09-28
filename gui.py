@@ -336,9 +336,12 @@ class PipelineAPI:
                     raise ValueError(f"Target {i}: receptor not found: {receptor}")
                 if receptor.suffix.lower() != ".pdbqt":
                     raise ValueError(f"Target {i}: receptor must be a prepared .pdbqt file: {receptor.name}")
-                with open(receptor, errors="replace") as f:
-                    if not any(line.startswith(("ATOM", "HETATM")) for line in f):
-                        raise ValueError(f"Target {i}: {receptor.name} has no ATOM records")
+                problem, placeholder = io_parse.check_receptor(receptor)
+                if problem:
+                    raise ValueError(f"Target {i}: {receptor.name}: {problem}")
+                if placeholder:
+                    warnings.append(f"Target {i}: {receptor.name} is the placeholder receptor; "
+                                    "choose your real prepared receptor before a real screen.")
 
                 try:
                     center = [float(v) for v in t.get("center", [])]
@@ -565,6 +568,61 @@ class PipelineAPI:
             state.phase = "error"
             state.message = str(exc)
             state.log_line(f"ERROR: {exc}\n{traceback.format_exc()}")
+
+    def tranche_report(self, workdir: str, label: str) -> dict[str, Any]:
+        """Everything useful for debugging one tranche, as one readable text report.
+
+        Status and counts, VinaLC's command and any errors it printed, and the
+        ends of the download/docking logs — the same files listed in README's
+        Troubleshooting section, gathered in one place.
+        """
+        try:
+            tdir = (Path(workdir).expanduser().resolve() / "tranches" / label)
+            if not tdir.is_dir():
+                raise ValueError(f"No such tranche folder: {tdir}")
+            logs, dock = tdir / "logs", tdir / "docking"
+
+            def read(path: Path) -> str:
+                return path.read_text(errors="replace").strip() if path.exists() else ""
+
+            def count_lines(path: Path) -> int:
+                return max(0, sum(1 for _ in open(path, errors="replace")) - 1) if path.exists() else 0
+
+            def section(title: str, body: str) -> str:
+                return f"==== {title} ====\n{body.strip() or '(empty)'}\n"
+
+            n_archives = pipeline.count_ligand_archives(tdir / "download") if (tdir / "download").exists() else 0
+            counts = [
+                f"status:              {pipeline.read_status(tdir)}",
+                f"downloaded archives: {n_archives}",
+                f"failed downloads:    {len(read(tdir / 'download_failures.txt').splitlines())}",
+                f"molecules unpacked:  {count_lines(tdir / 'ligand_index.tsv')}",
+                read(dock / "dock_summary.txt").replace("jobs=", "docking jobs:        ").replace("results=", "docked with a pose:  "),
+                f"unique ligands ranked: {count_lines(tdir / 'results' / 'ranked_all.tsv')} (ZINC repeats some compounds across archives)",
+            ]
+            vina_log = dock / f"{pipeline.VINALC_REC_LIST}_{pipeline.VINALC_LIG_LIST}.log.gz"
+            vina_log_head = ""
+            if vina_log.exists():
+                import gzip
+
+                with gzip.open(vina_log, "rt", errors="replace") as f:
+                    vina_log_head = "".join(line for _, line in zip(range(40), f))
+
+            parts = [
+                f"Tranche {label}  ({tdir})\n",
+                section("Summary", "\n".join(c for c in counts if c.strip())),
+                section("VinaLC errors", "\n".join(pipeline.vinalc_errors(logs / "dock.stderr.log", logs / "dock.stdout.log", limit=10))),
+                section("Docking command (docking/command.txt)", read(dock / "command.txt") + "\n" + read(dock / "dock_timing.txt")),
+                section("Docking stderr, last 40 lines (logs/dock.stderr.log)", "\n".join(pipeline.tail_lines(logs / "dock.stderr.log"))),
+                section("Docking stdout, last 15 lines (logs/dock.stdout.log)", "\n".join(pipeline.tail_lines(logs / "dock.stdout.log", 15))),
+                section("VinaLC per-ligand log, first 40 lines (docking/*.log.gz)", vina_log_head),
+                section("Download failures (download_failures.txt)", read(tdir / "download_failures.txt")),
+                section("Download stderr, last 15 lines (logs/download.stderr.log)", "\n".join(pipeline.tail_lines(logs / "download.stderr.log", 15))),
+                section("Unpack warnings (unpack_warnings.txt)", read(tdir / "unpack_warnings.txt")),
+            ]
+            return {"ok": True, "report": "\n".join(parts), "folder": str(tdir)}
+        except Exception as exc:
+            return {"ok": False, "message": str(exc)}
 
     @staticmethod
     def _read_top_hits(path: Path) -> list[dict[str, Any]]:

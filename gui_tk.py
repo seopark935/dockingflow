@@ -20,6 +20,7 @@ from __future__ import annotations
 import json
 import sys
 import tkinter as tk
+import tkinter.font as tkfont
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -30,7 +31,27 @@ from typing import Any, Dict, List, Optional
 POLL_MS = 1000
 MAX_HIT_ROWS = 500  # the full list is in top_hits_combined.tsv
 
-COLORS = {"ok": "#15803d", "err": "#b91c1c", "info": "#1d4ed8", "": "#374151"}
+# Light theme. Plain colors only (no images), so it renders the same over X11.
+P = {
+    "bg": "#eef0f3", "card": "#ffffff", "border": "#d5d9e0", "text": "#111827", "muted": "#6b7280",
+    "button": "#e8eaee", "button_hover": "#dde0e6",
+    "accent": "#2563eb", "accent_hover": "#1d4ed8", "accent_disabled": "#9dbaf3",
+    "ok": "#15803d", "ok_bg": "#dcfce7", "err": "#b91c1c", "err_bg": "#fee2e2",
+    "info": "#1d4ed8", "info_bg": "#dbeafe", "neutral_bg": "#e5e7eb",
+    "stripe": "#f7f8fa", "select": "#cfe0fd", "log_bg": "#111827", "log_fg": "#d1d5db",
+}
+COLORS = {"ok": P["ok"], "err": P["err"], "info": P["info"], "": P["muted"]}
+MESSAGE_BG = {"ok": P["ok_bg"], "err": P["err_bg"], "info": P["info_bg"], "": P["neutral_bg"]}
+
+# Friendlier names for the pipeline's tranche statuses.
+STATUS_TEXT = {
+    "PENDING": "Waiting", "INIT": "Queued", "DOWNLOADED": "Downloaded", "UNPACKED": "Unpacked",
+    "DOCKED": "Docked", "DONE": "Done",
+}
+PHASE_PILL = {  # run phase -> (text, fg, bg)
+    "idle": ("Idle", P["muted"], P["neutral_bg"]), "running": ("Running", P["info"], P["info_bg"]),
+    "done": ("Finished", P["ok"], P["ok_bg"]), "error": ("Error", P["err"], P["err_bg"]),
+}
 
 LARGE_SCREEN = 5_000_000  # molecules; above this, confirm before building the list
 
@@ -80,17 +101,17 @@ class DockingFlowApp(tk.Tk):
         super().__init__()
         self.api = api
         self.title("DockingFlow")
-        self.geometry("1200x800")
-        self.minsize(900, 600)
-        ttk.Style(self).theme_use("clam")
+        self.geometry("1280x840")
+        self.minsize(980, 640)
+        self._style()
 
         self.v = {name: tk.StringVar(self) for name in ("setup_path", "map_path", "workdir", "vinalc_bin", "mpirun_bin")}
         self.no_mpirun = tk.BooleanVar(self, value=False)
 
         # Ligands tab: ZINC22 tranche picker
-        # Defaults: a small drug-like slice, so a first click can't start a billion-molecule screen.
-        self.hac_min, self.hac_max = tk.IntVar(self, value=17), tk.IntVar(self, value=17)
-        self.logp_min, self.logp_max = tk.DoubleVar(self, value=1.0), tk.DoubleVar(self, value=1.5)
+        # Default: one ~40k-molecule tranche, a sensible pilot run; widen from there.
+        self.hac_min, self.hac_max = tk.IntVar(self, value=12), tk.IntVar(self, value=12)
+        self.logp_min, self.logp_max = tk.DoubleVar(self, value=1.0), tk.DoubleVar(self, value=1.0)
         self.charges = {c: tk.BooleanVar(self, value=c == "N") for c in CHARGES}
         self._zinc_job = None
 
@@ -124,38 +145,122 @@ class DockingFlowApp(tk.Tk):
             return None
 
     def set_message(self, text: str, kind: str = "") -> None:
-        self.message.configure(text=text, foreground=COLORS.get(kind, COLORS[""]))
+        self.message.configure(text=text, fg=P["text"] if not kind else COLORS[kind], bg=MESSAGE_BG.get(kind, P["neutral_bg"]))
+
+    # ---------- look ----------
+
+    def _style(self) -> None:
+        base = tkfont.nametofont("TkDefaultFont")
+        base.configure(size=10)
+        for name in ("TkTextFont", "TkMenuFont", "TkHeadingFont"):
+            tkfont.nametofont(name).configure(family=base.cget("family"), size=10)
+        self.font_bold = base.copy()
+        self.font_bold.configure(weight="bold")
+        self.font_title = base.copy()
+        self.font_title.configure(size=15, weight="bold")
+        self.font_mono = tkfont.nametofont("TkFixedFont").copy()
+        self.font_mono.configure(size=9)
+
+        self.configure(background=P["bg"])
+        st = ttk.Style(self)
+        st.theme_use("clam")
+        # Content widgets sit on white cards by default; the window frame is gray ("App.*").
+        st.configure(".", background=P["card"], foreground=P["text"], bordercolor=P["border"],
+                     lightcolor=P["card"], darkcolor=P["card"], troughcolor=P["bg"], focuscolor=P["accent"])
+        st.configure("App.TFrame", background=P["bg"])
+        st.configure("App.TLabel", background=P["bg"])
+        st.configure("Muted.TLabel", foreground=P["muted"])
+        st.configure("AppMuted.TLabel", background=P["bg"], foreground=P["muted"])
+        st.configure("Title.TLabel", background=P["bg"], font=self.font_title)
+        st.configure("Section.TLabel", font=self.font_bold)
+
+        st.configure("TLabelframe", background=P["card"], bordercolor=P["border"], relief="solid", borderwidth=1)
+        st.configure("TLabelframe.Label", background=P["card"], foreground=P["muted"], font=self.font_bold)
+        st.configure("Card.TFrame", background=P["card"], bordercolor=P["border"], relief="solid", borderwidth=1)
+
+        st.configure("TNotebook", background=P["bg"], borderwidth=0, tabmargins=(0, 0, 0, 0))
+        st.configure("TNotebook.Tab", background=P["button"], foreground=P["muted"], padding=(16, 7),
+                     bordercolor=P["border"])
+        st.map("TNotebook.Tab", background=[("selected", P["card"])], foreground=[("selected", P["text"])],
+               expand=[("selected", (0, 0, 0, 0))])
+
+        st.configure("TButton", background=P["button"], padding=(12, 5), bordercolor=P["border"], relief="flat")
+        st.map("TButton", background=[("active", P["button_hover"]), ("disabled", P["button"])],
+               foreground=[("disabled", P["muted"])])
+        st.configure("Accent.TButton", background=P["accent"], foreground="#ffffff", bordercolor=P["accent"],
+                     font=self.font_bold)
+        st.map("Accent.TButton", background=[("active", P["accent_hover"]), ("disabled", P["accent_disabled"])],
+               foreground=[("disabled", "#ffffff")])
+        st.configure("Danger.TButton", foreground=P["err"])
+        st.map("Danger.TButton", background=[("active", P["err_bg"])])
+
+        for widget in ("TEntry", "TSpinbox"):
+            st.configure(widget, fieldbackground="#ffffff", bordercolor=P["border"], padding=4,
+                         lightcolor=P["border"], darkcolor=P["border"])
+            st.map(widget, bordercolor=[("focus", P["accent"])], lightcolor=[("focus", P["accent"])])
+        st.configure("TCheckbutton", background=P["card"])
+        st.map("TCheckbutton", background=[("active", P["card"])])
+
+        st.configure("Treeview", background=P["card"], fieldbackground=P["card"], rowheight=24,
+                     bordercolor=P["border"], borderwidth=0)
+        st.map("Treeview", background=[("selected", P["select"])], foreground=[("selected", P["text"])])
+        st.configure("Treeview.Heading", background=P["stripe"], foreground=P["muted"], font=self.font_bold,
+                     relief="flat", padding=(6, 4))
+        st.map("Treeview.Heading", background=[("active", P["button"])])
+        st.configure("Accent.Horizontal.TProgressbar", background=P["accent"], troughcolor=P["neutral_bg"],
+                     bordercolor=P["neutral_bg"], lightcolor=P["accent"], darkcolor=P["accent"], thickness=8)
+        st.configure("TPanedwindow", background=P["bg"])
+        st.configure("Vertical.TScrollbar", background=P["button"], troughcolor=P["card"], bordercolor=P["card"],
+                     arrowcolor=P["muted"])
 
     # ---------- layout ----------
 
     def _build(self) -> None:
-        panes = ttk.PanedWindow(self, orient=tk.HORIZONTAL)
-        panes.pack(fill=tk.BOTH, expand=True, padx=8, pady=8)
+        outer = ttk.Frame(self, style="App.TFrame", padding=(14, 10, 14, 12))
+        outer.pack(fill=tk.BOTH, expand=True)
 
-        left = ttk.Frame(panes, width=440)
-        right = ttk.Frame(panes)
+        header = ttk.Frame(outer, style="App.TFrame")
+        header.pack(fill=tk.X, pady=(0, 10))
+        ttk.Label(header, text="DockingFlow", style="Title.TLabel").pack(side=tk.LEFT)
+        self.subtitle = ttk.Label(header, text="virtual screening with VinaLC", style="AppMuted.TLabel")
+        self.subtitle.pack(side=tk.LEFT, padx=(10, 0), pady=(5, 0))
+        self.pill = tk.Label(header, text="Idle", font=self.font_bold, padx=12, pady=3)
+        self.pill.pack(side=tk.RIGHT)
+        self.set_phase("idle")
+
+        panes = ttk.PanedWindow(outer, orient=tk.HORIZONTAL)
+        panes.pack(fill=tk.BOTH, expand=True)
+        left = ttk.Frame(panes, style="App.TFrame", width=470)
+        right = ttk.Frame(panes, style="App.TFrame")
         panes.add(left, weight=0)
         panes.add(right, weight=1)
 
         tabs = ttk.Notebook(left)
-        tabs.pack(fill=tk.BOTH, expand=True)
+        tabs.pack(fill=tk.BOTH, expand=True, padx=(0, 12))
         tabs.add(self._build_ligands(tabs), text="Ligands")
         tabs.add(self._build_targets_tab(tabs), text="Targets")
         tabs.add(self._build_docking(tabs), text="Docking")
         tabs.add(self._build_resources(tabs), text="Resources")
 
-        actions = ttk.Frame(left, padding=(0, 8, 0, 0))
-        actions.pack(fill=tk.X)
-        ttk.Button(actions, text="Validate", command=self.validate).pack(side=tk.LEFT)
-        self.run_btn = ttk.Button(actions, text="Run pipeline", command=self.start_run)
-        self.run_btn.pack(side=tk.LEFT, padx=6)
-        ttk.Button(actions, text="Nuke workdir", command=self.nuke).pack(side=tk.RIGHT)
-        ttk.Button(actions, text="Clean outputs", command=self.clean).pack(side=tk.RIGHT, padx=6)
-
-        self.message = ttk.Label(left, text="Loading...", wraplength=420, justify=tk.LEFT, padding=(2, 8))
-        self.message.pack(fill=tk.X)
+        actions = ttk.Frame(left, style="Card.TFrame", padding=10)
+        actions.pack(fill=tk.X, padx=(0, 12), pady=(10, 0))
+        row = ttk.Frame(actions)
+        row.pack(fill=tk.X)
+        ttk.Button(row, text="Validate", command=self.validate).pack(side=tk.LEFT)
+        self.run_btn = ttk.Button(row, text="Run pipeline", style="Accent.TButton", command=self.start_run)
+        self.run_btn.pack(side=tk.LEFT, padx=8)
+        ttk.Button(row, text="Nuke workdir", style="Danger.TButton", command=self.nuke).pack(side=tk.RIGHT)
+        ttk.Button(row, text="Clean outputs", command=self.clean).pack(side=tk.RIGHT, padx=8)
+        self.message = tk.Label(actions, text="Loading...", wraplength=420, justify=tk.LEFT, anchor="w",
+                                padx=10, pady=8)
+        self.message.pack(fill=tk.X, pady=(10, 0))
+        self.set_message("Loading...")
 
         self._build_status(right)
+
+    def set_phase(self, phase: str) -> None:
+        text, fg, bg = PHASE_PILL.get(phase, PHASE_PILL["idle"])
+        self.pill.configure(text=text, fg=fg, bg=bg)
 
     def _file_row(self, parent: ttk.Frame, row: int, label: str, var: tk.StringVar, kind: Optional[str]) -> None:
         ttk.Label(parent, text=label).grid(row=row, column=0, sticky="w", pady=(6, 0), columnspan=2)
@@ -165,7 +270,7 @@ class DockingFlowApp(tk.Tk):
                 row=row + 1, column=1, padx=(4, 0))
 
     def _build_ligands(self, parent: ttk.Notebook) -> ttk.Frame:
-        f = ttk.Frame(parent, padding=10)
+        f = ttk.Frame(parent, padding=14)
         f.columnconfigure(0, weight=1)
         pick = ttk.LabelFrame(f, text="Choose ZINC22 tranches", padding=8)
         pick.grid(row=0, column=0, columnspan=2, sticky="ew")
@@ -199,7 +304,7 @@ class DockingFlowApp(tk.Tk):
         return f
 
     def _build_docking(self, parent: ttk.Notebook) -> ttk.Frame:
-        f = ttk.Frame(parent, padding=10)
+        f = ttk.Frame(parent, padding=14)
         f.columnconfigure(0, weight=1)
         self._file_row(f, 0, "Docking binary (vinalc, or its full path)", self.v["vinalc_bin"], "file")
         self._file_row(f, 2, "MPI launcher", self.v["mpirun_bin"], None)
@@ -212,7 +317,7 @@ class DockingFlowApp(tk.Tk):
             ttk.Label(box, text=label).grid(row=r, column=0, sticky="w", pady=2)
             e = ttk.Entry(box, textvariable=self.settings[key], width=8, justify=tk.RIGHT)
             e.grid(row=r, column=1, padx=6)
-            ttk.Label(box, text=hint, foreground=COLORS[""]).grid(row=r, column=2, sticky="w")
+            ttk.Label(box, text=hint, style="Muted.TLabel").grid(row=r, column=2, sticky="w")
         self.settings["exhaustiveness"].trace_add("write", lambda *_: self.schedule_plan())
 
         self._file_row(f, 6, "Settings file (setup.txt)", self.v["setup_path"], "file")
@@ -220,7 +325,7 @@ class DockingFlowApp(tk.Tk):
         return f
 
     def _build_targets_tab(self, parent: ttk.Notebook) -> ttk.Frame:
-        f = ttk.Frame(parent, padding=10)
+        f = ttk.Frame(parent, padding=14)
         ttk.Label(
             f, wraplength=400, justify=tk.LEFT,
             text="Each receptor (a prepared .pdbqt) is docked within its grid box: the box center and its "
@@ -235,7 +340,7 @@ class DockingFlowApp(tk.Tk):
         return f
 
     def _build_resources(self, parent: ttk.Notebook) -> ttk.Frame:
-        f = ttk.Frame(parent, padding=10)
+        f = ttk.Frame(parent, padding=14)
         buttons = ttk.Frame(f)
         buttons.pack(fill=tk.X)
         ttk.Button(buttons, text="Detect this machine", command=self.detect_resources).pack(side=tk.LEFT)
@@ -246,11 +351,11 @@ class DockingFlowApp(tk.Tk):
 
         ttk.Label(f, text="CPU cores to use").pack(anchor="w")
         self.cores_scale = tk.Scale(f, from_=1, to=1, orient=tk.HORIZONTAL, variable=self.cores,
-                                    command=lambda _: self.schedule_plan(), highlightthickness=0)
+                                    command=lambda _: self.schedule_plan(), **self._scale_look())
         self.cores_scale.pack(fill=tk.X)
         ttk.Label(f, text="Memory budget (GB)").pack(anchor="w", pady=(6, 0))
         self.mem_scale = tk.Scale(f, from_=1, to=1, orient=tk.HORIZONTAL, variable=self.memory_gb,
-                                  command=lambda _: self.schedule_plan(), highlightthickness=0)
+                                  command=lambda _: self.schedule_plan(), **self._scale_look())
         self.mem_scale.pack(fill=tk.X)
 
         self.plan_label = ttk.Label(f, text="", justify=tk.LEFT, wraplength=400, padding=(0, 8))
@@ -261,39 +366,112 @@ class DockingFlowApp(tk.Tk):
         ttk.Button(buttons2, text="Use recommended", command=self.use_recommended).pack(side=tk.LEFT)
         return f
 
+    @staticmethod
+    def _scale_look() -> Dict[str, Any]:
+        return dict(highlightthickness=0, bg=P["card"], fg=P["text"], troughcolor=P["neutral_bg"],
+                    activebackground=P["accent_hover"], sliderrelief=tk.FLAT, bd=0, sliderlength=22, width=12)
+
     def _tree(self, parent: tk.Widget, columns: List[tuple], height: int) -> ttk.Treeview:
         frame = ttk.Frame(parent)
         frame.pack(fill=tk.BOTH, expand=True)
         tree = ttk.Treeview(frame, columns=[c[0] for c in columns], show="headings", height=height)
-        for name, width in columns:
-            tree.heading(name, text=name)
-            tree.column(name, width=width, anchor="w")
+        for name, width, *anchor in columns:
+            tree.heading(name, text=name, anchor=anchor[0] if anchor else "w")
+            tree.column(name, width=width, anchor=anchor[0] if anchor else "w", stretch=True)
+        tree.tag_configure("odd", background=P["stripe"])
         scroll = ttk.Scrollbar(frame, orient=tk.VERTICAL, command=tree.yview)
         tree.configure(yscrollcommand=scroll.set)
         tree.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
         scroll.pack(side=tk.RIGHT, fill=tk.Y)
         return tree
 
-    def _build_status(self, right: ttk.Frame) -> None:
-        box = ttk.LabelFrame(right, text="Tranches", padding=6)
-        box.pack(fill=tk.X)
-        self.tranche_tree = self._tree(
-            box, [("Label", 110), ("LogP", 60), ("Size", 80), ("Status", 130), ("Error", 380)], 5)
-        self.tranche_tree.tag_configure("DONE", foreground=COLORS["ok"])
-        self.tranche_tree.tag_configure("FAILED", foreground=COLORS["err"])
+    def _card(self, parent: tk.Widget, title: str, **pack: Any) -> ttk.Frame:
+        card = ttk.Frame(parent, style="Card.TFrame", padding=(12, 10))
+        card.pack(**pack)
+        head = ttk.Frame(card)
+        head.pack(fill=tk.X, pady=(0, 6))
+        ttk.Label(head, text=title, style="Section.TLabel").pack(side=tk.LEFT)
+        card.head = head
+        return card
 
-        box = ttk.LabelFrame(right, text="Log", padding=6)
-        box.pack(fill=tk.BOTH, pady=8)
-        self.log = tk.Text(box, height=10, wrap=tk.WORD, state=tk.DISABLED, font=("TkFixedFont", 9))
-        scroll = ttk.Scrollbar(box, orient=tk.VERTICAL, command=self.log.yview)
+    def _build_status(self, right: ttk.Frame) -> None:
+        box = self._card(right, "Tranches", fill=tk.X)
+        ttk.Button(box.head, text="Details...", command=self.show_details).pack(side=tk.RIGHT)
+        self.progress_text = ttk.Label(box.head, text="", style="Muted.TLabel")
+        self.progress_text.pack(side=tk.RIGHT, padx=10)
+        self.progress = ttk.Progressbar(box, style="Accent.Horizontal.TProgressbar", mode="determinate")
+        self.progress.pack(fill=tk.X, pady=(0, 8))
+        self.tranche_tree = self._tree(
+            box, [("Tranche", 100), ("LogP", 60, "e"), ("Size", 80), ("Status", 120), ("Error", 420)], 6)
+        self.tranche_tree.tag_configure("DONE", foreground=P["ok"])
+        self.tranche_tree.tag_configure("FAILED", foreground=P["err"])
+        self.tranche_tree.tag_configure("ACTIVE", foreground=P["info"])
+        self.tranche_tree.bind("<Double-1>", lambda _e: self.show_details())
+
+        box = self._card(right, "Log", fill=tk.BOTH, pady=10)
+        frame = ttk.Frame(box)
+        frame.pack(fill=tk.BOTH, expand=True)
+        self.log = tk.Text(frame, height=9, wrap=tk.WORD, state=tk.DISABLED, font=self.font_mono,
+                           bg=P["log_bg"], fg=P["log_fg"], relief=tk.FLAT, padx=10, pady=8,
+                           highlightthickness=0, insertbackground=P["log_fg"])
+        scroll = ttk.Scrollbar(frame, orient=tk.VERTICAL, command=self.log.yview)
         self.log.configure(yscrollcommand=scroll.set)
         self.log.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
         scroll.pack(side=tk.RIGHT, fill=tk.Y)
 
-        box = ttk.LabelFrame(right, text="Top hits (combined, ranked by affinity)", padding=6)
-        box.pack(fill=tk.BOTH, expand=True)
+        box = self._card(right, "Top hits", fill=tk.BOTH, expand=True)
+        ttk.Label(box.head, text="best predicted binders first (more negative = stronger)",
+                  style="Muted.TLabel").pack(side=tk.LEFT, padx=10)
         self.hits_tree = self._tree(
-            box, [("Ligand", 220), ("Affinity (kcal/mol)", 130), ("Receptor", 140), ("Tranche", 100)], 10)
+            box, [("Ligand", 240), ("Affinity (kcal/mol)", 140, "e"), ("Receptor", 150), ("Tranche", 110)], 10)
+
+    # ---------- per-tranche debug report ----------
+
+    def show_details(self) -> None:
+        sel = self.tranche_tree.selection()
+        if not sel:
+            self.set_message("Select a tranche in the Tranches table first, then click Details.", "info")
+            return
+        label = self.tranche_tree.item(sel[0])["values"][0]
+        win = tk.Toplevel(self)
+        win.title(f"DockingFlow - tranche {label}")
+        win.geometry("980x680")
+        win.configure(background=P["bg"])
+        top = ttk.Frame(win, style="App.TFrame", padding=(12, 10, 12, 6))
+        top.pack(fill=tk.X)
+        ttk.Label(top, text=f"Tranche {label}", style="Title.TLabel").pack(side=tk.LEFT)
+        body = ttk.Frame(win, style="Card.TFrame", padding=6)
+        body.pack(fill=tk.BOTH, expand=True, padx=12, pady=(0, 12))
+        text = tk.Text(body, wrap=tk.NONE, font=self.font_mono, relief=tk.FLAT, padx=10, pady=8,
+                       highlightthickness=0, bg=P["card"], fg=P["text"])
+        ys = ttk.Scrollbar(body, orient=tk.VERTICAL, command=text.yview)
+        xs = ttk.Scrollbar(body, orient=tk.HORIZONTAL, command=text.xview)
+        text.configure(yscrollcommand=ys.set, xscrollcommand=xs.set)
+        ys.pack(side=tk.RIGHT, fill=tk.Y)
+        xs.pack(side=tk.BOTTOM, fill=tk.X)
+        text.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+        text.tag_configure("head", font=self.font_bold, foreground=P["accent"])
+        text.tag_configure("err", foreground=P["err"])
+
+        def load() -> None:
+            res = self.call("tranche_report", self.v["workdir"].get(), label)
+            text.configure(state=tk.NORMAL)
+            text.delete("1.0", tk.END)
+            report = res["report"] if res and res.get("ok") else (res or {}).get("message", "Couldn't load the report.")
+            for line in report.splitlines():
+                tag = "head" if line.startswith("====") else ("err" if pipeline_error(line) else "")
+                text.insert(tk.END, line + "\n", tag)
+            text.configure(state=tk.DISABLED)
+
+        def copy() -> None:
+            self.clipboard_clear()
+            self.clipboard_append(text.get("1.0", tk.END))
+            self.set_message(f"Copied the report for {label}; paste it wherever you need it.", "ok")
+
+        ttk.Button(top, text="Close", command=win.destroy).pack(side=tk.RIGHT)
+        ttk.Button(top, text="Copy report", command=copy).pack(side=tk.RIGHT, padx=8)
+        ttk.Button(top, text="Refresh", command=load).pack(side=tk.RIGHT)
+        load()
 
     # ---------- startup ----------
 
@@ -535,6 +713,7 @@ class DockingFlowApp(tk.Tk):
             return
         self.machine, self.recommended = res["resources"], res["recommended"]
         m = self.machine
+        self.subtitle.configure(text=f"virtual screening with VinaLC on {m['hostname']}")
         lines = [f"{m['hostname']}  ({m['source']})",
                  f"CPU: {m['physical_cores']} physical cores, {m['logical_cpus']} logical"
                  + (f", load {m['load1']:.1f}" if m.get("load1") is not None else "")]
@@ -649,11 +828,27 @@ class DockingFlowApp(tk.Tk):
     def render_status(self, s: Dict[str, Any]) -> None:
         last = self._last_status
         if s["tranches"] != last.get("tranches"):
+            selected = [self.tranche_tree.item(i)["values"][0] for i in self.tranche_tree.selection()]
             self.tranche_tree.delete(*self.tranche_tree.get_children())
-            for t in s["tranches"]:
-                tag = "DONE" if t["status"] == "DONE" else ("FAILED" if t["status"].startswith("FAILED") else "")
-                self.tranche_tree.insert("", tk.END, values=(t["label"], t["log_p"], t["size"], t["status"], t["error"] or ""),
-                                         tags=(tag,))
+            for k, t in enumerate(s["tranches"]):
+                status = t["status"]
+                if status == "DONE":
+                    tag, text = "DONE", "Done"
+                elif status.startswith("FAILED"):
+                    tag, text = "FAILED", "Failed: " + status.split("_", 1)[-1].lower()
+                else:
+                    tag, text = ("ACTIVE" if status not in ("PENDING", "INIT") else ""), STATUS_TEXT.get(status, status)
+                iid = self.tranche_tree.insert(
+                    "", tk.END, values=(t["label"], t["log_p"], t["size"], text, t["error"] or ""),
+                    tags=tuple(x for x in (tag, "odd" if k % 2 else "") if x))
+                if t["label"] in selected:
+                    self.tranche_tree.selection_add(iid)
+            n = len(s["tranches"])
+            done = sum(1 for t in s["tranches"] if t["status"] == "DONE")
+            failed = sum(1 for t in s["tranches"] if t["status"].startswith("FAILED"))
+            self.progress.configure(maximum=max(n, 1), value=done + failed)
+            self.progress_text.configure(
+                text=(f"{done} of {n} done" + (f", {failed} failed" if failed else "")) if n else "")
 
         if s["log"] != last.get("log"):
             at_bottom = self.log.yview()[1] > 0.98
@@ -666,17 +861,30 @@ class DockingFlowApp(tk.Tk):
 
         if s["top_hits"] != last.get("top_hits"):
             self.hits_tree.delete(*self.hits_tree.get_children())
-            for h in s["top_hits"][:MAX_HIT_ROWS]:
-                self.hits_tree.insert("", tk.END, values=(h["ligand"], f"{h['affinity']:.3f}", h["receptor"], h["tranche"]))
+            for k, h in enumerate(s["top_hits"][:MAX_HIT_ROWS]):
+                self.hits_tree.insert("", tk.END, values=(h["ligand"], f"{h['affinity']:.2f}", h["receptor"], h["tranche"]),
+                                      tags=("odd",) if k % 2 else ())
 
         if s["phase"] != last.get("phase"):
+            self.set_phase(s["phase"])
             self.run_btn.configure(state=tk.DISABLED if s["phase"] == "running" else tk.NORMAL)
             if last and s["phase"] == "done":
-                self.set_message(s["message"], "ok")
+                failed = [t["label"] for t in s["tranches"] if t["status"].startswith("FAILED")]
+                if failed:
+                    self.set_message(f"Finished, but {len(failed)} tranche(s) failed ({', '.join(failed[:5])}"
+                                     f"{'...' if len(failed) > 5 else ''}). Select one and click Details to see why.",
+                                     "err")
+                else:
+                    self.set_message(s["message"], "ok")
             elif last and s["phase"] == "error":
                 self.set_message(s["message"], "err")
         self._last_status = s
 
+
+def pipeline_error(line: str) -> bool:
+    """Whether a report line looks like an error worth highlighting."""
+    low = line.lower()
+    return any(w in low for w in ("error", "failed (rc", "failed:", "cannot", "can't", "not found"))
 
 def main() -> int:
     if len(sys.argv) != 2 or "token=" not in sys.argv[1]:

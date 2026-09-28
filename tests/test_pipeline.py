@@ -184,6 +184,50 @@ class DockingFlowEndToEndTest(unittest.TestCase):
         self.assertTrue((self.workdir / "unrelated.txt").exists())
 
 
+class VinaLCFailureTest(unittest.TestCase):
+    """VinaLC exits 0 even when every job fails; the pipeline must notice and say why."""
+
+    def setUp(self):
+        self.tmp = Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, self.tmp, ignore_errors=True)
+
+    def _receptor(self, text):
+        p = self.tmp / "rec.pdbqt"
+        p.write_text(text)
+        return io_parse.check_receptor(p)
+
+    def test_check_receptor_mirrors_vinalc_reader(self):
+        atom = "ATOM      1  CA  ALA A   1      10.000  10.000  10.000  1.00  0.00     0.000 C\n"
+        self.assertEqual(self._receptor("REMARK x\n" + atom + "TER\n"), (None, False))
+        self.assertIn("'ROOT'", self._receptor("ROOT\n" + atom + "ENDROOT\nTORSDOF 0\n")[0])
+        self.assertIn("'END'", self._receptor(atom + "END\n")[0])
+        self.assertIn("atom type", self._receptor(atom[:77] + "\n")[0])  # a .pdb, not a .pdbqt
+        self.assertEqual(self._receptor("REMARK only\n")[0], "no ATOM/HETATM records")
+        self.assertEqual(io_parse.check_receptor(REPO_ROOT / "protein.pdbqt"), (None, True))
+
+    def test_dock_failure_message_quotes_vinalc(self):
+        wrapper = self.tmp / "vinalc"
+        wrapper.write_text(
+            "#!/bin/sh\n"
+            "printf '\\n\\nParse error on line 4 in file \"rec.pdbqt\": Unknown or inappropriate tag\\n' >&2\n"
+            f"{sys.executable} -c \"import gzip; gzip.open('recList.txt_ligList.txt.pdbqt.gz','wt').write(chr(10))\"\n"
+        )
+        wrapper.chmod(0o755)
+        tdir = self.tmp / "tranche2"
+        tdir.mkdir()
+        (tdir / "ligand_list.txt").write_text("x.pdbqt\n")
+        (tdir / "ligand_index.tsv").write_text("index\tligand\tsource\n1\tZINC1\ta.tgz\n2\tZINC2\ta.tgz\n")
+        pipeline.write_status(tdir, "UNPACKED")
+        targets = io_parse.load_docking_targets(io_parse.load_setup(REPO_ROOT / "setup.txt"))
+        opts = io_parse.VinaLCOptions(mpi_ranks=2, energy_range="3", exhaustiveness=8, num_modes=9)
+        with self.assertRaises(RuntimeError) as ctx:
+            pipeline.dock_tranche(tdir, targets, options=opts, vinalc_bin=str(wrapper), mpirun_bin=None)
+        msg = str(ctx.exception)
+        self.assertIn("none of the 2 docking job(s)", msg)
+        self.assertIn("Unknown or inappropriate tag", msg)
+        self.assertEqual(pipeline.read_status(tdir), "FAILED_DOCK")
+
+
 class UnpackFormatTest(unittest.TestCase):
     def setUp(self):
         self.tmp = Path(tempfile.mkdtemp(prefix="dockingflow_unpack_"))
@@ -505,7 +549,7 @@ class GuiEditingTest(unittest.TestCase):
             {"receptor": str(self.tmp / "protein.pdbqt"), "center": ["1", "2", "3.5"], "size": ["20", "22", "24"]},
         ])
         self.assertTrue(res["ok"], res)
-        self.assertEqual(res["warnings"], [])
+        self.assertEqual([w for w in res["warnings"] if "box" in w], [])
         targets = io_parse.load_docking_targets(io_parse.load_setup(Path(self.setup)))
         self.assertEqual((targets[0].box.center_z, targets[0].box.size_y), (3.5, 22.0))
 
@@ -524,7 +568,7 @@ class GuiEditingTest(unittest.TestCase):
             {"receptor": str(self.tmp / "protein.pdbqt"), "center": [0, 0, 0], "size": [80, 80, 80]},
         ])
         self.assertTrue(res["ok"])
-        self.assertEqual(len(res["warnings"]), 1)
+        self.assertEqual(len([w for w in res["warnings"] if "box" in w]), 1)
 
 
 if __name__ == "__main__":

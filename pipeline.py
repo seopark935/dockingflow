@@ -25,6 +25,7 @@ from __future__ import annotations
 
 import argparse
 import gzip
+import re
 import shutil
 import subprocess
 import tarfile
@@ -459,6 +460,36 @@ VINALC_LIG_LIST = "ligList.txt"
 VINALC_POSES = f"{VINALC_REC_LIST}_{VINALC_LIG_LIST}.pdbqt.gz"
 
 
+# Lines VinaLC's workers print when a single docking job fails (it still exits 0).
+_VINALC_ERROR_RE = re.compile(r"(Parse error|Error:|error occurred|File system error|Usage error|could not open)", re.I)
+
+
+def tail_lines(path: Path, n: int = 40, max_bytes: int = 256_000) -> list[str]:
+    """The last `n` lines of a possibly huge text file, reading only its end."""
+    if not path.exists():
+        return []
+    with open(path, "rb") as f:
+        f.seek(0, 2)
+        f.seek(max(0, f.tell() - max_bytes))
+        return f.read().decode("utf-8", errors="replace").splitlines()[-n:]
+
+
+def vinalc_errors(*paths: Path, limit: int = 3) -> list[str]:
+    """Distinct error messages VinaLC printed into these log files (first `limit`)."""
+    found: list[str] = []
+    for path in paths:
+        if not path.exists():
+            continue
+        with open(path, errors="replace") as f:
+            for line in f:
+                line = line.strip()
+                if _VINALC_ERROR_RE.search(line) and line not in found:
+                    found.append(line)
+                    if len(found) >= limit:
+                        return found
+    return found
+
+
 def write_vinalc_inputs(docking_dir: Path, targets: list[DockingTarget], ligand_list_path: Path) -> None:
     """Write the three list files VinaLC reads, with absolute paths, into `docking_dir`."""
     write_text(docking_dir / VINALC_REC_LIST, "".join(f"{t.receptor}\n" for t in targets))
@@ -567,6 +598,24 @@ def dock_tranche(
     if not poses_path.exists():
         write_status(tdir, "FAILED_DOCK")
         raise RuntimeError(f"Docking for {tdir.name} exited 0 but wrote no {poses_path.name}. See {stdout_log}")
+
+    # VinaLC exits 0 even when every job fails (e.g. an unreadable receptor),
+    # writing empty records; catch that here rather than at the rank stage.
+    n_results = sum(1 for _ in parse_vinalc_poses(poses_path))
+    n_ligands = sum(1 for _ in open(tdir / "ligand_index.tsv")) - 1
+    n_jobs = n_ligands * len(targets)
+    write_text(docking_dir / "dock_summary.txt", f"jobs={n_jobs}\nresults={n_results}\n")
+    errors = vinalc_errors(stderr_log, stdout_log)
+    if n_results == 0:
+        write_status(tdir, "FAILED_DOCK")
+        detail = f" VinaLC said: {' | '.join(errors)}" if errors else ""
+        raise RuntimeError(
+            f"VinaLC finished but none of the {n_jobs} docking job(s) for {tdir.name} produced a pose.{detail} "
+            f"See {stderr_log}"
+        )
+    if n_results < n_jobs:
+        print(f"[warn] {tdir.name}: {n_jobs - n_results} of {n_jobs} docking job(s) produced no pose"
+              + (f" (e.g. {errors[0]})" if errors else ""))
 
     write_status(tdir, "DOCKED")
 

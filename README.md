@@ -454,6 +454,25 @@ and the `--clean`/`--nuke` safety behavior.
 
 ## Troubleshooting
 
+**Where are the debug reports?** In the GUI, select a tranche in the
+Tranches table and click **Details...** (or double-click it): one report
+with the tranche's status and counts, the exact VinaLC command, any errors
+VinaLC printed, and the ends of its download/docking logs, with a **Copy
+report** button. The same files live under
+`<workdir>/tranches/<tranche>/` — `logs/dock.stderr.log`,
+`logs/dock.stdout.log`, `docking/command.txt`,
+`docking/recList.txt_ligList.txt.log.gz` (VinaLC's per-ligand log), and
+`download_failures.txt`.
+
+- **Every tranche fails with "none of the N docking job(s) produced a pose"**
+  (older versions said "no docking results found to rank") — VinaLC exits
+  normally even when every job fails, so the reason is in its stderr, which
+  the message quotes. The usual cause is the receptor: VinaLC's receptor
+  reader only accepts ATOM/HETATM, REMARK and TER lines, so a ligand-format
+  file (ROOT/BRANCH/TORSDOF — like the repo's old placeholder), a plain
+  `.pdb`, or an `END`/`CONECT` line fails every job. Validate now checks
+  receptors with the same rules and names the offending line.
+
 - **`FileNotFoundError: recList/geoList does not exist`** — relative
   paths in `setup.txt` are resolved against `setup.txt`'s own directory
   (not the directory you launch from).

@@ -207,6 +207,60 @@ def load_tranches_tsv(map_path: Path) -> List[Tranche]:
 
     return tranches
 
+# AutoDock atom types VinaLC understands in a PDBQT (element-based, plus H-bond variants).
+AD_TYPES = {
+    "C", "A", "N", "NA", "NS", "OA", "OS", "SA", "S", "H", "HD", "HS", "P", "F", "Cl", "CL", "Br", "BR", "I",
+    "Si", "B", "Fe", "FE", "Zn", "ZN", "Mg", "MG", "Mn", "MN", "Ca", "CA", "Na", "K", "Cu", "Co", "Ni", "Se",
+    "Hg", "Cd", "Met", "G0", "G1", "G2", "G3", "CG0", "CG1", "CG2", "CG3", "W",
+}
+
+# Marker in the placeholder receptor shipped with the repo.
+PLACEHOLDER_MARK = "Placeholder receptor for dockingflow"
+
+
+def check_receptor(path: Path) -> Tuple[Optional[str], bool]:
+    """Check a receptor .pdbqt the way VinaLC's rigid-receptor reader will.
+
+    VinaLC only accepts ATOM/HETATM, REMARK, TER and WARNING lines (and
+    blank lines) in a receptor, and every docking job fails — silently,
+    with VinaLC still exiting 0 — on anything else, e.g. ligand-style
+    ROOT/BRANCH/TORSDOF lines or an END/CONECT line some tools add.
+
+    Returns:
+        `(problem, is_placeholder)`: a description of the first problem
+        (None if the file looks dockable), and whether it's the repo's
+        placeholder receptor.
+    """
+    placeholder = False
+    n_atoms = 0
+    with open(path, errors="replace") as f:
+        for n, line in enumerate(f, start=1):
+            line = line.rstrip("\n")
+            if PLACEHOLDER_MARK in line:
+                placeholder = True
+            if not line.strip() or line.startswith(("REMARK", "TER", "WARNING")):
+                continue
+            if line.startswith(("ATOM  ", "HETATM")):
+                try:
+                    float(line[30:38]), float(line[38:46]), float(line[46:54])
+                except ValueError:
+                    return f"line {n}: bad x/y/z coordinates: {line.strip()}", placeholder
+                atom_type = line[77:].strip()
+                if atom_type not in AD_TYPES:
+                    return (f"line {n}: missing or unknown AutoDock atom type {atom_type!r} (is it really a "
+                            f"prepared .pdbqt, not a .pdb?): {line.strip()}"), placeholder
+                n_atoms += 1
+                continue
+            tag = line.split()[0]
+            hint = (" -- that's ligand format; prepare the receptor with prepare_receptor (ADFR/MGLTools) "
+                    "or Meeko's mk_prepare_receptor.py" if tag in ("ROOT", "ENDROOT", "BRANCH", "ENDBRANCH", "TORSDOF")
+                    else " -- delete that line (VinaLC's receptor reader only accepts ATOM/HETATM, REMARK and TER)")
+            return f"line {n}: VinaLC can't read a {tag!r} line in a receptor{hint}", placeholder
+    if n_atoms == 0:
+        return "no ATOM/HETATM records", placeholder
+    return None, placeholder
+
+
 def load_docking_targets(setup: Dict[str, str]) -> List[DockingTarget]:
     """Pair up recList.txt lines (receptor paths) with geoList.txt lines (grid boxes).
 
@@ -464,8 +518,12 @@ def validate_inputs(setup: Dict[str, str], tranches: List[Tranche], workdir: Pat
 
     load_vinalc_options(setup)
 
-    # Fail fast on malformed recList/geoList pairing rather than during docking.
-    load_docking_targets(setup)
+    # Fail fast on malformed recList/geoList pairing, or receptors VinaLC
+    # can't read, rather than during docking.
+    for t in load_docking_targets(setup):
+        problem, _ = check_receptor(t.receptor)
+        if problem:
+            raise ValueError(f"Receptor {t.receptor.name}: {problem}")
 
     if not tranches:
         raise ValueError("No tranches loaded from mapping file")
@@ -498,10 +556,16 @@ def format_summary(setup: Dict[str, str], tranches: List[Tranche], workdir: Path
     files are downloaded.
     """
     opts = load_vinalc_options(setup)
+    warnings = "".join(
+        f"WARNING: {t.receptor.name} is the repo's placeholder receptor: results will be meaningless. "
+        "Choose your real receptor in the Targets tab.\n"
+        for t in load_docking_targets(setup) if check_receptor(t.receptor)[1]
+    )
     logps = sorted({t.log_p for t in tranches})
     sizes = sorted({tranche_size(t) for t in tranches})
     return (
         "Inputs look valid.\n"
+        f"{warnings}"
         f"Workdir: {workdir}\n"
         f"Tranches: {len(tranches)}\n"
         f"log_p bins ({len(logps)}): {logps}\n"
