@@ -29,7 +29,7 @@ import math
 import re
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 
 # ZINC22 3D tranche code: H<heavy atom count><M|P><logP code>, e.g. H04M000,
 # H17P050. The logP code is logP * 100 (M = minus, P = plus).
@@ -259,6 +259,66 @@ def check_receptor(path: Path) -> Tuple[Optional[str], bool]:
     if n_atoms == 0:
         return "no ATOM/HETATM records", placeholder
     return None, placeholder
+
+
+# Largest grid box side the GUI allows, in Å: enough to cover a typical
+# protein for blind docking. Bigger boxes mostly add empty search space.
+MAX_BOX_SIDE = 80.0
+
+
+def read_coordinates(path: Path) -> List[Tuple[float, float, float]]:
+    """Atom coordinates from a PDB/PDBQT, MOL2, SDF/MOL or XYZ file.
+
+    Raises:
+        ValueError: If no coordinates can be read.
+    """
+    lines = path.read_text(errors="replace").splitlines()
+    suffix = path.suffix.lower()
+    coords: List[Tuple[float, float, float]] = []
+    try:
+        if suffix == ".mol2":
+            in_atoms = False
+            for line in lines:
+                if line.startswith("@<TRIPOS>"):
+                    in_atoms = line.strip() == "@<TRIPOS>ATOM"
+                elif in_atoms and line.strip():
+                    f = line.split()
+                    coords.append((float(f[2]), float(f[3]), float(f[4])))
+        elif suffix in (".sdf", ".mol"):
+            n_atoms = int(lines[3][:3])  # V2000 counts line; first molecule only
+            for line in lines[4:4 + n_atoms]:
+                f = line.split()
+                coords.append((float(f[0]), float(f[1]), float(f[2])))
+        elif suffix == ".xyz":
+            for line in lines[2:2 + int(lines[0])]:
+                f = line.split()
+                coords.append((float(f[1]), float(f[2]), float(f[3])))
+        else:  # PDB / PDBQT / anything with ATOM/HETATM records
+            for line in lines:
+                if line.startswith(("ATOM", "HETATM")):
+                    coords.append((float(line[30:38]), float(line[38:46]), float(line[46:54])))
+    except (ValueError, IndexError) as exc:
+        raise ValueError(f"Couldn't read atom coordinates from {path.name}: {exc}")
+    if not coords:
+        raise ValueError(f"No atom coordinates found in {path.name} (expected PDB/PDBQT, MOL2, SDF or XYZ)")
+    return coords
+
+
+def fit_box(coords: List[Tuple[float, float, float]], padding: float, min_side: float = 0.0,
+            max_side: float = MAX_BOX_SIDE) -> Dict[str, Any]:
+    """A grid box around `coords`: centered on their bounding box, `padding` Å added on every side.
+
+    Returns center, size (each side clamped to [min_side, max_side]), the
+    atoms' own extent, and which sides hit `max_side`.
+    """
+    lo = [min(c[k] for c in coords) for k in range(3)]
+    hi = [max(c[k] for c in coords) for k in range(3)]
+    extent = [hi[k] - lo[k] for k in range(3)]
+    center = [round((hi[k] + lo[k]) / 2, 3) for k in range(3)]
+    size = [round(min(max(extent[k] + 2 * padding, min_side), max_side), 1) for k in range(3)]
+    capped = ["xyz"[k] for k in range(3) if extent[k] + 2 * padding > max_side]
+    return {"center": center, "size": size, "extent": [round(e, 1) for e in extent], "capped": capped,
+            "atoms": len(coords)}
 
 
 def load_docking_targets(setup: Dict[str, str]) -> List[DockingTarget]:

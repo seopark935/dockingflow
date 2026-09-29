@@ -79,20 +79,26 @@ before pointing it at a real screen.
    A DockingFlow window opens on your own screen. Everything in it —
    machine detection, file browsing, downloads, docking — happens on the
    server.
-2. In the window, work through the tabs left to right:
-   - **Ligands** — pick the ZINC22 slice to screen (heavy atoms, logP,
-     charges); the tab shows how many tranches/molecules that is. Click
-     **Create tranche list** and the tranche list fills itself in (see
-     [ZINC22 downloads](#zinc22-downloads)). Set the **Work directory** to
-     somewhere with plenty of disk.
-   - **Targets** — Browse to your prepared receptor `.pdbqt`, and enter the
-     grid box center and size (Å) around the binding pocket. Add more
-     receptors with **+ Add receptor**.
-   - **Docking** — `vinalc` (or its full path), and the docking settings:
-     keep-top %, exhaustiveness, poses per ligand, energy range, seed.
-   - **Resources** — the server is detected automatically and the CPU/memory
-     sliders are pre-set to a recommendation; adjust if you share the
-     machine.
+2. In the window, work through the numbered tabs (click **How to use** at the
+   top right for a walkthrough, and any **?** button for an explanation of
+   that setting; everything starts at a sensible default):
+   - **1 Ligands** — pick a library preset: *Quick test* (~1,000 molecules,
+     the default), *Fragments (Rule of Three)*, *Lead-like*, or *Drug-like
+     (Lipinski)*; or adjust heavy atoms, logP and charges from the dropdowns
+     (choosing *Custom*). The panel shows how many molecules that is. Click
+     **Create tranche list** (see [ZINC22 downloads](#zinc22-downloads)),
+     and set the **Work directory** to a disk with plenty of space.
+   - **2 Targets** — Browse to your prepared receptor `.pdbqt`, then set the
+     grid box: **Center on known site…** (pick a ligand from the same
+     structure, e.g. a co-crystallized inhibitor; box = ligand + 5 Å, at
+     least 20 Å per side), or **Fit to whole protein** for blind docking
+     (measures the receptor; each side capped at 80 Å). Or type center/size
+     in Å. Add more receptors with **+ Add receptor**.
+   - **3 Docking** — `vinalc` (or its full path) and the docking settings,
+     pre-filled with the standard defaults (**Reset to defaults** restores
+     them). For blind-docking boxes, raise exhaustiveness to 16-32.
+   - **4 Resources** — the server is detected automatically and the
+     CPU/memory sliders are pre-set to a recommendation.
    - **Validate**, then **Run pipeline**. All settings, targets and the
      CPU/memory budget are saved to the settings file (`project/setup.txt`)
      first, so the command line uses the same values. Progress, the log,

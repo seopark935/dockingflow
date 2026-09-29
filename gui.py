@@ -56,7 +56,8 @@ REPO_ROOT = Path(__file__).resolve().parent
 PROJECT_DIR = REPO_ROOT / "project"
 PROJECT_SEED_FILES = ["setup.txt", "recList.txt", "geoList.txt", "protein.pdbqt"]
 
-# Vina's documentation recommends search boxes of at most ~30 Å per side.
+# Above this box side (Å), docking is effectively "blind" (whole-protein):
+# fine, but slower, and it needs more exhaustiveness to search reliably.
 LARGE_BOX_ANGSTROM = 30
 
 
@@ -68,8 +69,11 @@ def ensure_project_dir() -> Path:
             if not (PROJECT_DIR / name).exists():
                 shutil.copy2(REPO_ROOT / name, PROJECT_DIR / name)
         # No CPU/memory budget yet: the GUI recommends one for this machine,
-        # and saves the user's choice on the first Validate/Run.
-        resources.set_setup_keys(str(PROJECT_DIR / "setup.txt"), {"cores": None, "memory_gb": None})
+        # and saves the user's choice on the first Validate/Run. Docking
+        # settings start at VinaLC's standard defaults.
+        resources.set_setup_keys(str(PROJECT_DIR / "setup.txt"), {
+            "cores": None, "memory_gb": None, "energy_range": "3", "filter_percent": "10",
+        })
     return PROJECT_DIR
 
 
@@ -317,6 +321,31 @@ class PipelineAPI:
         except Exception as exc:
             return {"ok": False, "message": str(exc)}
 
+    def fit_box_to_receptor(self, receptor: str) -> dict[str, Any]:
+        """Blind docking: a box around the whole receptor (5 Å margin), each side capped at 80 Å."""
+        try:
+            box = io_parse.fit_box(io_parse.read_coordinates(Path(receptor).expanduser()), padding=5)
+            msg = (f"Box fitted to the whole receptor ({box['atoms']:,} atoms, "
+                   f"{' x '.join(f'{e:g}' for e in box['extent'])} Å across) for blind docking.")
+            if box["capped"]:
+                msg += (f" The protein is wider than {io_parse.MAX_BOX_SIDE:g} Å along {', '.join(box['capped'])}, "
+                        "so the box was capped there and misses some of its surface. If you know the binding "
+                        "site, center the box on it instead.")
+            return {"ok": True, **box, "message": msg}
+        except Exception as exc:
+            return {"ok": False, "message": str(exc)}
+
+    def fit_box_to_site(self, reference: str) -> dict[str, Any]:
+        """Known site: a box around a reference ligand (e.g. a co-crystallized inhibitor), >= 20 Å per side."""
+        try:
+            box = io_parse.fit_box(io_parse.read_coordinates(Path(reference).expanduser()), padding=5, min_side=20)
+            return {"ok": True, **box, "message": (
+                f"Box centered on {Path(reference).name} ({box['atoms']} atoms) with a 5 Å margin "
+                f"(at least 20 Å per side). Make sure that file is in the same coordinate frame as your receptor, "
+                f"e.g. both taken from the same PDB entry.")}
+        except Exception as exc:
+            return {"ok": False, "message": str(exc)}
+
     def save_targets(self, setup_path: str, targets: list[dict[str, Any]]) -> dict[str, Any]:
         """Validate the edited receptor/grid-box rows and write recList.txt + geoList.txt.
 
@@ -352,11 +381,16 @@ class PipelineAPI:
                     raise ValueError(f"Target {i}: box needs center x/y/z and size x/y/z")
                 if min(size) <= 0:
                     raise ValueError(f"Target {i}: box sizes must be > 0")
+                if max(size) > io_parse.MAX_BOX_SIDE:
+                    raise ValueError(
+                        f"Target {i}: box sides can be at most {io_parse.MAX_BOX_SIDE:g} Å (blind docking of a "
+                        f"typical protein). Use 'Fit to whole protein' to size it automatically."
+                    )
                 if max(size) > LARGE_BOX_ANGSTROM:
                     warnings.append(
-                        f"Target {i}: box is up to {max(size):g} Å per side. Vina recommends <= "
-                        f"{LARGE_BOX_ANGSTROM} Å around the binding pocket; bigger boxes dock slower, "
-                        f"less accurately, and need more memory per worker."
+                        f"Target {i}: a {max(size):g} Å box is blind docking (the whole protein). That's fine, "
+                        f"but slower; consider exhaustiveness 16-32 in the Docking tab so the larger space is "
+                        f"searched thoroughly."
                     )
                 rec_rows.append(str(receptor))
                 geo_rows.append(" ".join(f"{v:g}" for v in center + size))

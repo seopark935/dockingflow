@@ -46,6 +46,36 @@ HAC_MIN, HAC_MAX = 4, 29
 
 CHARGES = {"J": -4, "K": -3, "L": -2, "M": -1, "N": 0, "O": 1, "P": 2, "Q": 3, "R": 4}
 
+# logP bins ZINC22 uses (the tranche code's P/M number / 100).
+LOGP_BINS = [-5.0, -4.0, -3.0, -2.0, -1.0] + [round(x / 10, 1) for x in range(0, 51)] + [6.0, 7.0, 8.0, 9.0]
+
+# Common screening libraries, expressed in ZINC22's axes. ZINC22 bins by heavy
+# (non-hydrogen) atom count rather than molecular weight; drug-like molecules
+# average ~13-14 Da per heavy atom, so e.g. 25 heavy atoms ~ 350 Da. 3D files
+# stop at 29 heavy atoms (~400 Da), so wider definitions are capped there.
+LIGAND_PRESETS = {
+    "Quick test (~1,000 molecules)": dict(
+        hac=(10, 10), logp=(3.1, 3.1), charges="Neutral only",
+        help="One small tranche of about 1,000 molecules: a fast end-to-end test of your setup."),
+    "Fragments (Rule of Three)": dict(
+        hac=(8, 19), logp=(-1.0, 3.0), charges="Neutral only",
+        help="Small, simple molecules (up to ~250 Da, logP <= 3) for fragment-based screening: "
+             "weak binders that are good starting points to grow from."),
+    "Lead-like": dict(
+        hac=(17, 25), logp=(-1.0, 3.5), charges="Neutral and +/-1",
+        help="~250-350 Da, logP <= 3.5: room to add potency and still stay drug-like. "
+             "The usual choice for a first large virtual screen."),
+    "Drug-like (Lipinski)": dict(
+        hac=(17, 29), logp=(-1.0, 5.0), charges="Neutral and +/-1",
+        help="Lipinski's rule of five (logP <= 5; MW <= 500, capped at ~400 Da here because ZINC22's 3D "
+             "files stop at 29 heavy atoms). Broadest drug-like set; very large."),
+}
+CHARGE_PRESETS = {
+    "Neutral only": ["N"],
+    "Neutral and +/-1": ["M", "N", "O"],
+    "All charges (-4 to +4)": list(CHARGES),
+}
+
 # An archive's key, e.g. "zinc-22a/H05/H05M000/a/H05M000-O-aaaaaa.pdbqt.tgz", from any of
 # CartBlanche's formats: a files.docking.org URL (curl/wget), an s3:// URI (AWS), or an S3 URL.
 _KEY_RE = re.compile(r"(?:files\.docking\.org/zinc22/|s3://zinc3d/|zinc3d\.s3\.amazonaws\.com/)(zinc-22\w/\S+)")

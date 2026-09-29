@@ -368,6 +368,56 @@ class ZincSplitTest(unittest.TestCase):
         self.assertEqual(script.count(zinc22.DOCKING_ORG_BASE), 2)
 
 
+class GridBoxTest(unittest.TestCase):
+    def setUp(self):
+        self.tmp = Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, self.tmp, ignore_errors=True)
+
+    def test_read_coordinates_formats(self):
+        files = {
+            "a.pdb": "HETATM    1  C1  LIG A   1       1.000   2.000   3.000  1.00  0.00           C\n",
+            "a.mol2": "@<TRIPOS>MOLECULE\nx\n@<TRIPOS>ATOM\n 1 C1 1.0 2.0 3.0 C.3\n@<TRIPOS>BOND\n",
+            "a.sdf": "x\n  prog\n\n  1  0  0  0  0  0  0  0  0  0999 V2000\n    1.0000    2.0000    3.0000 C   0  0\nM  END\n",
+            "a.xyz": "1\ncomment\nC 1.0 2.0 3.0\n",
+        }
+        for name, text in files.items():
+            (self.tmp / name).write_text(text)
+            self.assertEqual(io_parse.read_coordinates(self.tmp / name), [(1.0, 2.0, 3.0)], name)
+        (self.tmp / "empty.pdb").write_text("REMARK nothing\n")
+        with self.assertRaises(ValueError):
+            io_parse.read_coordinates(self.tmp / "empty.pdb")
+
+    def test_fit_box_pads_clamps_and_caps(self):
+        box = io_parse.fit_box([(0, 0, 0), (10, 4, 100)], padding=5, min_side=20)
+        self.assertEqual(box["center"], [5.0, 2.0, 50.0])
+        self.assertEqual(box["size"], [20.0, 20.0, io_parse.MAX_BOX_SIDE])  # min 20, capped at 80
+        self.assertEqual(box["capped"], ["z"])
+
+    def test_gui_fit_and_80_angstrom_limit(self):
+        import gui
+
+        api = gui.PipelineAPI()
+        res = api.fit_box_to_receptor(str(REPO_ROOT / "protein.pdbqt"))
+        self.assertTrue(res["ok"])
+        self.assertEqual(res["center"], [11.0, 10.0, 10.0])
+        shutil.copy(REPO_ROOT / "setup.txt", self.tmp / "setup.txt")
+        for name in ("recList.txt", "geoList.txt"):
+            shutil.copy(REPO_ROOT / name, self.tmp / name)
+        big = api.save_targets(str(self.tmp / "setup.txt"), [
+            {"receptor": str(REPO_ROOT / "protein.pdbqt"), "center": [0, 0, 0], "size": [81, 20, 20]}])
+        self.assertFalse(big["ok"])
+        self.assertIn("80", big["message"])
+
+    def test_ligand_presets_are_valid_selections(self):
+        for name, p in zinc22.LIGAND_PRESETS.items():
+            self.assertLessEqual(zinc22.HAC_MIN, p["hac"][0], name)
+            self.assertLessEqual(p["hac"][0], p["hac"][1], name)
+            self.assertLessEqual(p["hac"][1], zinc22.HAC_MAX, name)
+            self.assertIn(p["logp"][0], zinc22.LOGP_BINS, name)
+            self.assertIn(p["logp"][1], zinc22.LOGP_BINS, name)
+            self.assertIn(p["charges"], zinc22.CHARGE_PRESETS, name)
+
+
 class Zinc22Test(unittest.TestCase):
     KEY = "zinc-22a/H05/H05M000/a/H05M000-O-daaaaa.pdbqt.tgz"
 
