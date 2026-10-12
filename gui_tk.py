@@ -22,6 +22,7 @@ Usage (normally via `bash gui.sh`):
 from __future__ import annotations
 
 import json
+import subprocess
 import sys
 import tkinter as tk
 import tkinter.font as tkfont
@@ -29,7 +30,7 @@ import urllib.error
 import urllib.parse
 import urllib.request
 from pathlib import Path
-from tkinter import filedialog, messagebox, ttk
+from tkinter import filedialog, messagebox, simpledialog, ttk
 from typing import Any, Dict, List, Optional
 
 from zinc22 import CHARGE_PRESETS, LIGAND_PRESETS, LOGP_BINS, HAC_MAX, HAC_MIN
@@ -64,6 +65,9 @@ PHASE_PILL = {  # run phase -> (text, fg, bg)
 
 CHARGES = {"J": "-4", "K": "-3", "L": "-2", "M": "-1", "N": "0", "O": "+1", "P": "+2", "Q": "+3", "R": "+4"}
 CUSTOM = "Custom"
+
+# How "Keep top %" picks the final hits (setup.txt's rank_scope).
+RANK_SCOPES = {"the whole screen": "overall", "each tranche separately": "per_tranche"}
 DEFAULT_PRESET = "Quick test (~1,000 molecules)"
 
 # (setup.txt key, label, default shown when setup.txt doesn't set it) for the Docking tab.
@@ -155,6 +159,25 @@ HELP = {
         "After docking, each tranche's ligands are ranked by predicted binding strength and this top "
         "percentage is kept as hits (always at least one). All scores are still saved in ranked_all.tsv. "
         "Default 10."),
+    "rank_scope": (
+        "Which hits to keep",
+        "'Keep top %' can apply to:\n\n"
+        "- the whole screen (default): every docked ligand from every tranche is ranked together and the "
+        "top % of that combined list are your hits. Usually what you want.\n"
+        "- each tranche separately: each tranche contributes its own top %, so every size/logP bin is "
+        "represented even if its scores are weaker.\n\n"
+        "Either way, every score is kept in results/ranked_all_combined.tsv."),
+    "results": (
+        "Top hits and result files",
+        "The table lists the hits, strongest predicted binder first (more negative kcal/mol = stronger). It "
+        "updates after each tranche finishes, and shows saved results when you reopen the window.\n\n"
+        "Files, in the work directory's results/ folder:\n"
+        "- top_hits_combined.tsv: the hits (ligand, affinity, receptor, tranche).\n"
+        "- ranked_all_combined.tsv: every docked ligand, best first.\n"
+        "- poses/: after 'Export poses', each hit's best docked pose as a .pdbqt file, all of them in "
+        "top_hits_poses.pdbqt, and a copy of the receptor, ready for PyMOL or ChimeraX.\n\n"
+        "Per-tranche results are in tranches/<tranche>/results/. Affinities are AutoDock Vina scores: "
+        "useful for ranking, but rough as absolute binding energies."),
     "exhaustiveness": (
         "Exhaustiveness",
         "How hard Vina searches for each ligand's best pose. Higher is more reliable but slower (roughly "
@@ -277,6 +300,8 @@ class DockingFlowApp(tk.Tk):
 
         # Docking tab: settings saved into setup.txt
         self.settings = {k: tk.StringVar(self, value=d) for k, _, d in SETTINGS}
+        self.rank_scope = tk.StringVar(self, value="the whole screen")
+        self._results_job = None
         self.cores = tk.IntVar(self, value=1)
         self.memory_gb = tk.IntVar(self, value=1)
 
@@ -297,13 +322,39 @@ class DockingFlowApp(tk.Tk):
     def call(self, name: str, *args: Any) -> Any:
         """Call the server; on a dropped connection, say so and return None."""
         try:
-            return getattr(self.api, name)(*args)
+            res = getattr(self.api, name)(*args)
         except ConnectionError:
             self.set_message(
                 "Lost connection to the DockingFlow GUI server. Any run keeps going on the server; "
                 "run 'bash gui.sh' again to reconnect.", "err",
             )
             return None
+        if isinstance(res, dict) and str(res.get("message", "")).startswith("unknown API method"):
+            self.set_message("The GUI server is running older code than this window (it was started before "
+                             "your last update). Restart it: close this window and run 'bash gui.sh restart'.", "err")
+        return res
+
+    def check_server_version(self) -> bool:
+        """Offer to restart a GUI server that predates the code on disk. Returns False if restarting."""
+        from gui import REPO_ROOT, code_version
+
+        info = self.call("server_info")
+        if info and info.get("ok") and info.get("version") == code_version():
+            return True
+        phase = (info or {}).get("phase") or (self.call("get_status") or {}).get("phase")  # old servers: no server_info
+        running = phase in ("running", "stopping")
+        if not messagebox.askyesno(
+            "Restart the GUI server?",
+            "The DockingFlow server is still running the code from before your last update (git pull), so "
+            "some buttons won't work until it restarts.\n\nRestart it now? This window will reopen in a few "
+            "seconds."
+            + ("\n\nA run is in progress: it will be stopped, and you can Resume it afterwards without losing "
+               "finished work." if running else ""),
+        ):
+            return True
+        subprocess.Popen(["bash", str(REPO_ROOT / "gui.sh"), "restart"], start_new_session=True)
+        self.destroy()
+        return False
 
     def set_message(self, text: str, kind: str = "") -> None:
         self.message.configure(text=text, fg=P["text"] if not kind else COLORS[kind], bg=MESSAGE_BG.get(kind, P["neutral_bg"]))
@@ -562,6 +613,12 @@ class DockingFlowApp(tk.Tk):
             self.help_button(grid, key).grid(row=r, column=2)
             if default:
                 ttk.Label(grid, text=f"default {default}", style="Muted.TLabel").grid(row=r, column=3, sticky="w", padx=6)
+        scope_row = ttk.Frame(f)
+        scope_row.pack(fill=tk.X, pady=(4, 0))
+        ttk.Label(scope_row, text="Keep top % of").pack(side=tk.LEFT)
+        ttk.Combobox(scope_row, textvariable=self.rank_scope, state="readonly", values=list(RANK_SCOPES),
+                     width=22).pack(side=tk.LEFT, padx=6)
+        self.help_button(scope_row, "rank_scope").pack(side=tk.LEFT)
         ttk.Button(f, text="Reset to defaults", command=self.reset_settings).pack(anchor="w", pady=(6, 0))
         self.settings["exhaustiveness"].trace_add("write", lambda *_: self.schedule_plan())
 
@@ -650,8 +707,11 @@ class DockingFlowApp(tk.Tk):
         scroll.pack(side=tk.RIGHT, fill=tk.Y)
 
         box = self._card(right, "Top hits", fill=tk.BOTH, expand=True)
-        ttk.Label(box.head, text="strongest predicted binders first (more negative = stronger)",
-                  style="Muted.TLabel").pack(side=tk.LEFT, padx=8)
+        self.help_button(box.head, "results").pack(side=tk.LEFT, padx=6)
+        self.hits_note = ttk.Label(box.head, text="strongest predicted binders first (more negative = stronger)",
+                                   style="Muted.TLabel")
+        self.hits_note.pack(side=tk.LEFT, padx=4)
+        ttk.Button(box.head, text="Export poses...", command=self.export_poses).pack(side=tk.RIGHT)
         self.hits_tree = self._tree(
             box, [("Ligand", 220), ("Affinity (kcal/mol)", 120, "e"), ("Receptor", 130), ("Tranche", 90)], 8)
 
@@ -707,11 +767,15 @@ class DockingFlowApp(tk.Tk):
     # ---------- startup ----------
 
     def _startup(self) -> None:
+        if not self.check_server_version():
+            return
         d = self.call("get_defaults")
         if d is None:
             return
         for key in self.v:
             self.v[key].set(d[key])
+        self.load_disk_results()
+        self.v["workdir"].trace_add("write", lambda *_: self.schedule_disk_results())
         self.detect_resources()
         self.schedule_zinc_summary()
         s = self.call("get_status")
@@ -741,12 +805,15 @@ class DockingFlowApp(tk.Tk):
         saved = res["settings"]
         for key, _, default in SETTINGS:
             self.settings[key].set(saved.get(key) or default)
+        scope = saved.get("rank_scope") or "overall"
+        self.rank_scope.set(next((k for k, v in RANK_SCOPES.items() if v == scope), "the whole screen"))
         self._saved_budget = (saved.get("cores"), saved.get("memory_gb"))
         self.apply_saved_budget()
 
     def reset_settings(self) -> None:
         for key, _, default in SETTINGS:
             self.settings[key].set(default)
+        self.rank_scope.set("the whole screen")
         self.set_message("Docking settings reset to defaults (saved on Validate/Run).", "info")
 
     def apply_saved_budget(self) -> None:
@@ -766,6 +833,7 @@ class DockingFlowApp(tk.Tk):
     def save_settings(self) -> bool:
         """Write every docking setting and the CPU/memory budget into setup.txt."""
         values = {key: self.settings[key].get() for key, _, _ in SETTINGS}
+        values["rank_scope"] = RANK_SCOPES.get(self.rank_scope.get(), "overall")
         cores, mem = self.budget()
         if cores is not None:
             values["cores"] = str(cores)
@@ -1189,30 +1257,80 @@ class DockingFlowApp(tk.Tk):
             self.render_status(s)
         self._poll_job = self.after(POLL_MS, self.poll)
 
+    def render_tranches(self, tranches: List[Dict[str, Any]]) -> None:
+        selected = [self.tranche_tree.item(i)["values"][0] for i in self.tranche_tree.selection()]
+        self.tranche_tree.delete(*self.tranche_tree.get_children())
+        for k, t in enumerate(tranches):
+            status = t["status"]
+            if status == "DONE":
+                tag, text = "DONE", "Done"
+            elif status.startswith("FAILED"):
+                tag, text = "FAILED", "Failed: " + status.split("_", 1)[-1].lower()
+            else:
+                tag, text = ("ACTIVE" if status not in ("PENDING", "INIT") else ""), STATUS_TEXT.get(status, status)
+            iid = self.tranche_tree.insert(
+                "", tk.END, values=(t["label"], t["log_p"], t["size"], text, t["error"] or ""),
+                tags=tuple(x for x in (tag, "odd" if k % 2 else "") if x))
+            if t["label"] in selected:
+                self.tranche_tree.selection_add(iid)
+        n = len(tranches)
+        done = sum(1 for t in tranches if t["status"] == "DONE")
+        failed = sum(1 for t in tranches if t["status"].startswith("FAILED"))
+        self.progress.configure(maximum=max(n, 1), value=done + failed)
+        self.progress_text.configure(text=(f"{done} of {n} done" + (f", {failed} failed" if failed else "")) if n else "")
+
+    def render_hits(self, hits: List[Dict[str, Any]], total: Optional[int] = None) -> None:
+        self.hits_tree.delete(*self.hits_tree.get_children())
+        for k, h in enumerate(hits[:MAX_HIT_ROWS]):
+            self.hits_tree.insert("", tk.END, values=(h["ligand"], f"{h['affinity']:.2f}", h["receptor"], h["tranche"]),
+                                  tags=("odd",) if k % 2 else ())
+        shown = min(len(hits), MAX_HIT_ROWS)
+        note = "strongest predicted binders first (more negative = stronger)"
+        if hits:
+            note = f"{shown:,} hit(s) shown, strongest first" + (f"; {total:,} ligands ranked in all" if total else "")
+        self.hits_note.configure(text=note)
+
+    def load_disk_results(self) -> None:
+        """Show the tranche statuses and hits saved in the work directory (e.g. after a server restart)."""
+        self._results_job = None
+        if not self.v["workdir"].get():
+            return
+        res = self.call("load_results", self.v["workdir"].get())
+        if not res or not res.get("ok"):
+            return
+        self.render_tranches(res["tranches"])
+        self.render_hits(res["top_hits"], res.get("ranked"))
+
+    def schedule_disk_results(self) -> None:
+        if self._last_status.get("phase") in ("running", "stopping"):
+            return  # a run is in progress: its live status is shown instead
+        if self._results_job:
+            self.after_cancel(self._results_job)
+        self._results_job = self.after(500, self.load_disk_results)
+
+    def export_poses(self) -> None:
+        n_hits = len(self.hits_tree.get_children())
+        if not n_hits:
+            self.set_message("No hits to export yet: run a screen first (or check the work directory).", "info")
+            return
+        n = simpledialog.askinteger(
+            "Export poses", "Export the best docked pose of how many top hits?",
+            initialvalue=min(100, n_hits), minvalue=1, parent=self)
+        if not n:
+            return
+        self.set_message("Exporting poses...", "info")
+        self.update_idletasks()
+        res = self.call("export_poses", self.v["workdir"].get(), self.v["setup_path"].get(), n)
+        if res:
+            self.set_message(res["message"], "ok" if res["ok"] else "err")
+
     def render_status(self, s: Dict[str, Any]) -> None:
         last = self._last_status
-        if s["tranches"] != last.get("tranches"):
-            selected = [self.tranche_tree.item(i)["values"][0] for i in self.tranche_tree.selection()]
-            self.tranche_tree.delete(*self.tranche_tree.get_children())
-            for k, t in enumerate(s["tranches"]):
-                status = t["status"]
-                if status == "DONE":
-                    tag, text = "DONE", "Done"
-                elif status.startswith("FAILED"):
-                    tag, text = "FAILED", "Failed: " + status.split("_", 1)[-1].lower()
-                else:
-                    tag, text = ("ACTIVE" if status not in ("PENDING", "INIT") else ""), STATUS_TEXT.get(status, status)
-                iid = self.tranche_tree.insert(
-                    "", tk.END, values=(t["label"], t["log_p"], t["size"], text, t["error"] or ""),
-                    tags=tuple(x for x in (tag, "odd" if k % 2 else "") if x))
-                if t["label"] in selected:
-                    self.tranche_tree.selection_add(iid)
-            n = len(s["tranches"])
-            done = sum(1 for t in s["tranches"] if t["status"] == "DONE")
-            failed = sum(1 for t in s["tranches"] if t["status"].startswith("FAILED"))
-            self.progress.configure(maximum=max(n, 1), value=done + failed)
-            self.progress_text.configure(
-                text=(f"{done} of {n} done" + (f", {failed} failed" if failed else "")) if n else "")
+        # While the server hasn't run anything, the tables show the work directory's saved results
+        # (load_disk_results) instead of its empty run state.
+        live = s["phase"] != "idle"
+        if live and s["tranches"] != last.get("tranches"):
+            self.render_tranches(s["tranches"])
 
         if s["log"] != last.get("log"):
             at_bottom = self.log.yview()[1] > 0.98
@@ -1223,11 +1341,8 @@ class DockingFlowApp(tk.Tk):
             if at_bottom:
                 self.log.see(tk.END)
 
-        if s["top_hits"] != last.get("top_hits"):
-            self.hits_tree.delete(*self.hits_tree.get_children())
-            for k, h in enumerate(s["top_hits"][:MAX_HIT_ROWS]):
-                self.hits_tree.insert("", tk.END, values=(h["ligand"], f"{h['affinity']:.2f}", h["receptor"], h["tranche"]),
-                                      tags=("odd",) if k % 2 else ())
+        if live and s["top_hits"] != last.get("top_hits"):
+            self.render_hits(s["top_hits"])
 
         if s["phase"] != last.get("phase"):
             self.set_phase(s["phase"])

@@ -519,6 +519,19 @@ def load_vinalc_options(setup: Dict[str, str]) -> VinaLCOptions:
     )
 
 
+# How "filter_percent" picks the final hits: the top % of the whole screen
+# ("overall", the default) or each tranche's own top % ("per_tranche").
+RANK_SCOPES = ("overall", "per_tranche")
+
+
+def rank_scope(setup: Dict[str, str]) -> str:
+    """setup.txt's `rank_scope`, validated; "overall" if unset."""
+    scope = setup.get("rank_scope", "overall")
+    if scope not in RANK_SCOPES:
+        raise ValueError(f"rank_scope must be one of {', '.join(RANK_SCOPES)} (got {scope!r})")
+    return scope
+
+
 def tranche_label(t: Tranche) -> str:
     """Filesystem-safe, deterministic tranche label (the ZINC22 code when there is one)."""
     if t.code:
@@ -577,6 +590,7 @@ def validate_inputs(setup: Dict[str, str], tranches: List[Tranche], workdir: Pat
         raise ValueError("filter_percent must be in (0, 100]")
 
     load_vinalc_options(setup)
+    rank_scope(setup)
 
     # Fail fast on malformed recList/geoList pairing, or receptors VinaLC
     # can't read, rather than during docking.

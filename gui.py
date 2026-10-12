@@ -33,6 +33,7 @@ GUI favors showing partial progress over an all-or-nothing run.
 from __future__ import annotations
 
 import argparse
+import hashlib
 import math
 import os
 import shutil
@@ -59,6 +60,21 @@ PROJECT_SEED_FILES = ["setup.txt", "recList.txt", "geoList.txt", "protein.pdbqt"
 # Above this box side (Å), docking is effectively "blind" (whole-protein):
 # fine, but slower, and it needs more exhaustiveness to search reliably.
 LARGE_BOX_ANGSTROM = 30
+
+
+def code_version() -> str:
+    """Fingerprint of the GUI/pipeline code on disk, so the window can tell when the running
+    server predates a `git pull` (and so lacks newer API methods)."""
+    h = hashlib.sha1()
+    for path in sorted(REPO_ROOT.glob("*.py")) + [REPO_ROOT / "gui_assets" / "index.html"]:
+        if path.exists():
+            h.update(path.name.encode())
+            h.update(path.read_bytes())
+    return h.hexdigest()[:12]
+
+
+# The code this server process was started with.
+CODE_VERSION = code_version()
 
 
 def ensure_project_dir() -> Path:
@@ -128,6 +144,10 @@ class PipelineAPI:
         self._window = window
 
     # ---- defaults / file pickers ----
+
+    def server_info(self) -> dict[str, Any]:
+        """Which code this server is running, and whether a run is in progress."""
+        return {"ok": True, "version": CODE_VERSION, "phase": self._state.phase}
 
     def get_defaults(self) -> dict[str, str]:
         """Prefill the form with the GUI's `project/` config (created on first launch)."""
@@ -245,8 +265,8 @@ class PipelineAPI:
 
     # ---- docking settings <-> setup.txt ----
 
-    SETTING_KEYS = ("filter_percent", "exhaustiveness", "num_modes", "energy_range", "seed", "granularity",
-                    "cores", "memory_gb")
+    SETTING_KEYS = ("filter_percent", "rank_scope", "exhaustiveness", "num_modes", "energy_range", "seed",
+                    "granularity", "cores", "memory_gb")
 
     def get_settings(self, setup_path: str) -> dict[str, Any]:
         """setup.txt's docking settings, as strings for the form ("" = not set / default)."""
@@ -280,6 +300,7 @@ class PipelineAPI:
                 raise ValueError("Keep top % must be a number")
             if not 0 < fp <= 100:
                 raise ValueError("Keep top % must be between 0 and 100")
+            io_parse.rank_scope(candidate)
             # Same checks the pipeline itself runs (skipping the memory-based rank
             # planning, which needs valid docking targets).
             io_parse.load_vinalc_options({k: v for k, v in candidate.items() if k != "memory_gb"})
@@ -583,7 +604,14 @@ class PipelineAPI:
                 prog.status = pipeline.read_status(tdir)
 
             filter_percent = float(setup["filter_percent"])
+            scope = io_parse.rank_scope(setup)
             mpirun = None if no_mpirun else mpirun_bin
+
+            def refresh_results() -> Path:
+                """Re-merge the finished tranches' results, so hits show up as the run goes."""
+                path = pipeline.combine_results(workdir_p, tdirs, filter_percent, scope)
+                state.top_hits = pipeline.read_combined_hits(workdir_p, self.MAX_HITS_SHOWN)
+                return path
 
             check = pipeline.CONTROL.check
             stage = ""
@@ -621,6 +649,7 @@ class PipelineAPI:
                         state.log_line(f"[{prog.label}] ranking...")
                         pipeline.rank_and_filter_tranche(tdir, filter_percent)
                         prog.status = pipeline.read_status(tdir)
+                        refresh_results()
                         state.log_line(f"[{prog.label}] done.")
                     except Exception as exc:
                         prog.status = pipeline.read_status(tdir)
@@ -634,8 +663,7 @@ class PipelineAPI:
                 if current is not None:
                     current.status = pipeline.read_status(tdirs[state.tranches.index(current)])
                     state.log_line(f"[{current.label}] stopped during {stage}; that step restarts when you resume.")
-                combined_path = pipeline.combine_results(workdir_p, tdirs)  # hits from finished tranches
-                state.top_hits = self._read_top_hits(combined_path)
+                refresh_results()  # hits from finished tranches
                 done = sum(1 for t in state.tranches if t.status == "DONE")
                 state.phase = "stopped"
                 state.message = (f"Stopped ({done} of {len(state.tranches)} tranche(s) done). Click Resume to "
@@ -643,8 +671,7 @@ class PipelineAPI:
                 state.log_line("Stopped.")
                 return
 
-            combined_path = pipeline.combine_results(workdir_p, tdirs)
-            state.top_hits = self._read_top_hits(combined_path)
+            combined_path = refresh_results()
             state.phase = "done"
             state.message = f"Finished. Combined results: {combined_path}"
         except pipeline.StopRequested:  # stopped before any tranche started (e.g. during setup)
@@ -710,17 +737,62 @@ class PipelineAPI:
         except Exception as exc:
             return {"ok": False, "message": str(exc)}
 
-    @staticmethod
-    def _read_top_hits(path: Path) -> list[dict[str, Any]]:
-        if not path.exists():
-            return []
-        rows = []
-        for line in path.read_text().splitlines()[1:]:
-            if not line.strip():
-                continue
-            lig, aff, receptor, tranche = line.split("\t")
-            rows.append({"ligand": lig, "affinity": float(aff), "receptor": receptor, "tranche": tranche})
-        return rows
+    # ---- results on disk ----
+
+    MAX_HITS_SHOWN = 500  # rows sent to the window; the files have everything
+
+    def load_results(self, workdir: str) -> dict[str, Any]:
+        """Tranche statuses and top hits as saved in `workdir`, for showing results without a run.
+
+        Lets the window show a finished (or stopped) screen after the GUI
+        server restarts, since the server's own run state only covers runs
+        it ran itself.
+        """
+        try:
+            wd = Path(workdir).expanduser().resolve()
+            tranches = []
+            for tdir in sorted((wd / "tranches").glob("*/")):
+                if not (tdir / "status.txt").exists():
+                    continue
+                meta = dict(line.split("=", 1) for line in (tdir / "meta.txt").read_text().splitlines()
+                            if "=" in line) if (tdir / "meta.txt").exists() else {}
+                status = pipeline.read_status(tdir)
+                tranches.append({
+                    "label": tdir.name,
+                    "log_p": meta.get("log_p", ""),
+                    "size": meta.get("size", ""),
+                    "status": status,
+                    "error": "failed; select it and click Details" if status.startswith("FAILED") else None,
+                })
+            hits = pipeline.read_combined_hits(wd, self.MAX_HITS_SHOWN)
+            n_ranked = 0
+            all_path = wd / "results" / "ranked_all_combined.tsv"
+            if all_path.exists():
+                with open(all_path) as f:
+                    n_ranked = max(0, sum(1 for _ in f) - 1)
+            return {"ok": True, "tranches": tranches, "top_hits": hits, "ranked": n_ranked,
+                    "results_dir": str(wd / "results")}
+        except Exception as exc:
+            return {"ok": False, "message": str(exc)}
+
+    def export_poses(self, workdir: str, setup_path: str, n: int) -> dict[str, Any]:
+        """Write the best pose of each of the top `n` hits to `<workdir>/results/poses/` (see pipeline)."""
+        try:
+            receptors: list[Path] = []
+            try:
+                receptors = [t.receptor for t in io_parse.load_docking_targets(io_parse.load_setup(Path(setup_path)))]
+            except Exception:
+                pass  # the poses are still useful without a receptor copy
+            res = pipeline.export_hit_poses(Path(workdir).expanduser().resolve(), int(n), receptors)
+            missing = res["requested"] - res["exported"]
+            msg = (f"Exported {res['exported']} pose(s) to {res['folder']} -- one .pdbqt per hit, "
+                   f"top_hits_poses.pdbqt with all of them, and the receptor. Open them together in PyMOL or "
+                   f"ChimeraX (e.g. copy the folder to your PC with MobaXterm's file browser).")
+            if missing:
+                msg += f" {missing} hit(s) had no pose file to read (their tranche's docking output is missing)."
+            return {"ok": True, **res, "message": msg}
+        except Exception as exc:
+            return {"ok": False, "message": str(exc)}
 
     # ---- polling ----
 

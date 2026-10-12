@@ -696,7 +696,8 @@ def dock_tranche(
     # VinaLC exits 0 even when every job fails (e.g. an unreadable receptor),
     # writing empty records; catch that here rather than at the rank stage.
     n_results = sum(1 for _ in parse_vinalc_poses(poses_path))
-    n_ligands = sum(1 for _ in open(tdir / "ligand_index.tsv")) - 1
+    with open(tdir / "ligand_index.tsv", encoding="utf-8") as f:
+        n_ligands = sum(1 for _ in f) - 1
     n_jobs = n_ligands * len(targets)
     write_text(docking_dir / "dock_summary.txt", f"jobs={n_jobs}\nresults={n_results}\n")
     errors = vinalc_errors(stderr_log, stdout_log)
@@ -828,27 +829,188 @@ def rank_and_filter_tranche(tdir: Path, filter_percent: float) -> Path:
     return top_path
 
 
-def combine_results(workdir: Path, tranche_dirs: list[Path]) -> Path:
-    """Merge every tranche's top_hits.tsv into one workdir-level ranking."""
-    combined: list[tuple[str, float, str, str]] = []
-    for tdir in tranche_dirs:
-        top_path = tdir / "results" / "top_hits.tsv"
-        if not top_path.exists():
-            continue
-        for line in top_path.read_text().splitlines()[1:]:
-            if not line.strip():
-                continue
-            lig, aff, receptor = line.split("\t")
-            combined.append((lig, float(aff), receptor, tdir.name))
+RESULTS_HEADER = "ligand\taffinity_kcal_mol\treceptor\ttranche\n"
 
-    combined.sort(key=lambda row: row[1])
-    out_path = workdir / "results" / "top_hits_combined.tsv"
-    write_text(
-        out_path,
-        "ligand\taffinity_kcal_mol\treceptor\ttranche\n"
-        + "".join(f"{lig}\t{aff:.3f}\t{rec}\t{tranche}\n" for lig, aff, rec, tranche in combined),
-    )
-    return out_path
+
+def _read_ranked(path: Path, tranche: str) -> Iterator[tuple[float, str, str, str]]:
+    """Rows of a tranche's ranked_all.tsv / top_hits.tsv as (affinity, ligand, receptor, tranche), in file order."""
+    with open(path, encoding="utf-8") as f:
+        next(f, None)  # header
+        for line in f:
+            parts = line.rstrip("\n").split("\t")
+            if len(parts) == 3:
+                yield float(parts[1]), parts[0], parts[2], tranche
+
+
+def combine_results(workdir: Path, tranche_dirs: list[Path], filter_percent: float = 100.0,
+                    scope: str = "overall") -> Path:
+    """Merge the tranches' rankings into workdir-level results; returns `top_hits_combined.tsv`.
+
+    Writes, under `<workdir>/results/`:
+
+      - `ranked_all_combined.tsv`: every docked ligand from every tranche,
+        strongest predicted binder first (each ligand once, at its best).
+      - `top_hits_combined.tsv`: the hits, as chosen by `scope`:
+          * "overall": the top `filter_percent`% of the whole screen.
+          * "per_tranche": each tranche's own top `filter_percent`%
+            (its `top_hits.tsv`), merged.
+
+    Each tranche's ranked_all.tsv is already sorted, so they are merged as
+    streams (`heapq.merge`) rather than loaded into memory at once. Safe to
+    call while a run is in progress: only tranches with results are used.
+    """
+    import heapq
+
+    results_dir = workdir / "results"
+    results_dir.mkdir(parents=True, exist_ok=True)
+    ranked = [(t / "results" / "ranked_all.tsv", t.name) for t in tranche_dirs]
+    streams = [_read_ranked(p, name) for p, name in ranked if p.exists()]
+
+    all_path = results_dir / "ranked_all_combined.tsv"
+    seen: set[str] = set()
+    n_all = 0
+    with open(all_path, "w", encoding="utf-8") as out:
+        out.write(RESULTS_HEADER)
+        for aff, lig, rec, tranche in heapq.merge(*streams):
+            if lig in seen:  # a compound can appear in two tranches; keep its best score
+                continue
+            seen.add(lig)
+            n_all += 1
+            out.write(f"{lig}\t{aff:.3f}\t{rec}\t{tranche}\n")
+
+    top_path = results_dir / "top_hits_combined.tsv"
+    if scope == "per_tranche":
+        tops = [_read_ranked(t / "results" / "top_hits.tsv", t.name) for t in tranche_dirs
+                if (t / "results" / "top_hits.tsv").exists()]
+        rows = list(heapq.merge(*tops))
+    else:
+        n_keep = max(1, round(n_all * filter_percent / 100)) if n_all else 0
+        rows = list(_read_ranked_combined(all_path, n_keep))
+    with open(top_path, "w", encoding="utf-8") as out:
+        out.write(RESULTS_HEADER)
+        for aff, lig, rec, tranche in rows:
+            out.write(f"{lig}\t{aff:.3f}\t{rec}\t{tranche}\n")
+    return top_path
+
+
+def _read_ranked_combined(path: Path, limit: int) -> Iterator[tuple[float, str, str, str]]:
+    """The first `limit` rows of a combined (4-column) results file."""
+    with open(path, encoding="utf-8") as f:
+        next(f, None)
+        for k, line in enumerate(f):
+            if k >= limit:
+                return
+            lig, aff, rec, tranche = line.rstrip("\n").split("\t")
+            yield float(aff), lig, rec, tranche
+
+
+def read_combined_hits(workdir: Path, limit: int | None = None) -> list[dict]:
+    """`top_hits_combined.tsv` as dicts (ligand, affinity, receptor, tranche), best first."""
+    path = workdir / "results" / "top_hits_combined.tsv"
+    if not path.exists():
+        return []
+    return [{"ligand": lig, "affinity": aff, "receptor": rec, "tranche": tranche}
+            for aff, lig, rec, tranche in _read_ranked_combined(path, limit if limit is not None else 10**12)]
+
+
+def export_hit_poses(workdir: Path, n: int, receptors: list[Path] | None = None) -> dict:
+    """Write the best docked pose of each of the top `n` combined hits as its own .pdbqt file.
+
+    Output, in `<workdir>/results/poses/` (replaced on each export):
+
+      - `001_<ligand>.pdbqt`, `002_...`: one file per hit, in rank order,
+        with REMARKs giving rank, affinity, receptor and tranche.
+      - `top_hits_poses.pdbqt`: all of them as MODELs in one file, to load
+        every hit at once (PyMOL/ChimeraX show them as states/models).
+      - a copy of each receptor, so the folder opens as-is in a viewer.
+
+    A hit's pose is found in its tranche's VinaLC output by matching ligand
+    number (via ligand_index.tsv), receptor and score.
+
+    Returns counts and the folder path. Raises ValueError if there are no hits yet.
+    """
+    hits = read_combined_hits(workdir, n)
+    if not hits:
+        raise ValueError("No hits yet: run (or finish) a screen first.")
+    out_dir = workdir / "results" / "poses"
+    if out_dir.exists():
+        shutil.rmtree(out_dir)
+    out_dir.mkdir(parents=True)
+
+    by_tranche: dict[str, list[tuple[int, dict]]] = {}
+    for rank, hit in enumerate(hits, start=1):
+        by_tranche.setdefault(hit["tranche"], []).append((rank, hit))
+
+    found: dict[int, list[str]] = {}  # rank -> pose lines (between MODEL and ENDMDL)
+    for tranche, wanted in by_tranche.items():
+        tdir = workdir / "tranches" / tranche
+        poses_path = tdir / "docking" / VINALC_POSES
+        if not poses_path.exists() or not (tdir / "ligand_index.tsv").exists():
+            continue
+        index = read_ligand_index(tdir)
+        want = {(h["ligand"], h["receptor"], round(h["affinity"], 3)): rank for rank, h in wanted}
+        for receptor, number, best, pose in _iter_best_poses(poses_path):
+            key = (index.get(number, f"LIGAND_{number}"), Path(receptor).stem, round(best, 3))
+            rank = want.pop(key, None)
+            if rank is not None:
+                found[rank] = pose
+            if not want:
+                break
+
+    combined = []
+    for rank, hit in enumerate(hits, start=1):
+        pose = found.get(rank)
+        if pose is None:
+            continue
+        header = [
+            f"REMARK  DockingFlow hit #{rank}: {hit['ligand']}",
+            f"REMARK  affinity {hit['affinity']:.3f} kcal/mol, receptor {hit['receptor']}, tranche {hit['tranche']}",
+        ]
+        safe = re.sub(r"[^A-Za-z0-9_.-]", "_", hit["ligand"])
+        write_text(out_dir / f"{rank:03d}_{safe}.pdbqt", "\n".join(header + pose) + "\n")
+        combined.append("\n".join([f"MODEL {rank}"] + header + pose + ["ENDMDL"]))
+    write_text(out_dir / "top_hits_poses.pdbqt", "\n".join(combined) + "\n")
+
+    for rec in receptors or []:
+        if rec.exists():
+            shutil.copy2(rec, out_dir / f"receptor_{rec.name}")
+    return {"exported": len(combined), "requested": len(hits), "folder": str(out_dir)}
+
+
+def _iter_best_poses(poses_path: Path) -> Iterator[tuple[str, int, float, list[str]]]:
+    """Yield `(receptor, ligand_number, best_affinity, best_pose_lines)` per record of a VinaLC output file."""
+    receptor: str | None = None
+    number: int | None = None
+    best: float | None = None
+    pose: list[str] = []
+    in_first = False
+    done_first = False
+
+    def record():
+        return receptor, number, best, pose
+
+    with gzip.open(poses_path, "rt", encoding="utf-8", errors="replace") as f:
+        for line in f:
+            line = line.rstrip("\n")
+            if line.startswith("REMARK RECEPTOR"):
+                if receptor is not None and number is not None and best is not None:
+                    yield record()
+                receptor, number, best, pose = line[len("REMARK RECEPTOR"):].strip(), None, None, []
+                in_first = done_first = False
+            elif line.startswith("REMARK LIGAND"):
+                number = int(line.split()[-1])
+            elif line.startswith("MODEL"):
+                in_first = not done_first
+            elif line.startswith("ENDMDL"):
+                if in_first:
+                    done_first = True
+                in_first = False
+            elif in_first:
+                if best is None and line.startswith("REMARK VINA RESULT:"):
+                    best = float(line.split()[3])
+                pose.append(line)
+    if receptor is not None and number is not None and best is not None:
+        yield record()
 
 
 # ----------------------------
@@ -1013,7 +1175,7 @@ def _main() -> int:
     # Stage 4: rank + filter results, then combine across tranches
     run_stage("rank", rank_and_filter_tranche, float(setup["filter_percent"]))
 
-    combined_path = combine_results(workdir, tranche_dirs)
+    combined_path = combine_results(workdir, tranche_dirs, float(setup["filter_percent"]), io_parse.rank_scope(setup))
     print(f"\nCombined top hits: {combined_path}")
     return finish("Pipeline complete")
 

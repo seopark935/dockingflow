@@ -277,10 +277,18 @@ statuses don't count as "past" any stage.
    best score across receptors, and writes `results/ranked_all.tsv`,
    `results/top_hits.tsv` (top `filter_percent`%, at least 1 ligand) and
    `results/summary.txt` (submitted vs. successfully docked).
-6. **Combine** (`combine_results`, run once per full pipeline invocation,
-   not per-tranche): merges every tranche's `top_hits.tsv` into one
-   workdir-level ranking at `workdir/results/top_hits_combined.tsv` — this
-   is the final deliverable of a screening run.
+6. **Combine** (`combine_results`, after every finished tranche, so results
+   grow as a run goes): merges every tranche's ranking into
+   `workdir/results/ranked_all_combined.tsv` (every docked ligand, best
+   first, each once) and picks the hits into
+   `workdir/results/top_hits_combined.tsv` — the final deliverable. With
+   `rank_scope=overall` (default) the hits are the top `filter_percent`% of
+   the whole screen; with `per_tranche`, each tranche's own top %.
+7. **Export poses** (optional, `export_hit_poses`; GUI: **Export poses…**
+   on the Top hits panel): writes each top hit's best docked pose to
+   `workdir/results/poses/` (`001_<ligand>.pdbqt`, ...), all of them in
+   `top_hits_poses.pdbqt`, plus a copy of the receptor — ready to open in
+   PyMOL or ChimeraX.
 
 ## CLI reference
 
@@ -379,7 +387,9 @@ rendered in a native window.
   - `ligList` *(optional, unused)* — per-tranche ligand lists are
     generated automatically in Stage 2.
   - `filter_percent` — number in `(0, 100]`; the top slice of ranked
-    ligands to keep per tranche.
+    ligands kept as hits.
+  - `rank_scope` *(optional)* — `overall` (default: top % of the whole
+    screen) or `per_tranche` (each tranche's own top %).
   - `cores` — integer `>= 1`; CPU cores the run may use. See
     [CPU and memory](#cpu-and-memory) for how this becomes `mpirun -np`.
   - `memory_gb` *(optional)* — RAM budget; caps the number of VinaLC
@@ -426,7 +436,9 @@ rendered in a native window.
 │           ├── top_hits.tsv          # top filter_percent% for this tranche
 │           └── summary.txt           # submitted vs. docked counts
 └── results/
-    └── top_hits_combined.tsv         # ligand, affinity, receptor, tranche — merged + re-ranked
+    ├── top_hits_combined.tsv         # the hits: ligand, affinity, receptor, tranche — best first
+    ├── ranked_all_combined.tsv       # every docked ligand from every tranche, best first
+    └── poses/                        # after "Export poses": best pose per hit + receptor copy
 ```
 
 ## Placeholders used for offline testing
@@ -478,6 +490,11 @@ report** button. The same files live under
 `docking/recList.txt_ligList.txt.log.gz` (VinaLC's per-ligand log), and
 `download_failures.txt`.
 
+- **"unknown API method: …" after updating** — the GUI server was started
+  before your `git pull` and is still running the old code. Run
+  `bash gui.sh restart` (the window also detects this and offers to
+  restart). Always restart after pulling updates; a run in progress is
+  stopped and can be resumed.
 - **Every tranche fails with "none of the N docking job(s) produced a pose"**
   (older versions said "no docking results found to rank") — VinaLC exits
   normally even when every job fails, so the reason is in its stderr, which

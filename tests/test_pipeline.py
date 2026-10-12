@@ -203,6 +203,87 @@ def _wait_until(pred, timeout: float = 20.0) -> bool:
     return False
 
 
+class ResultsTest(unittest.TestCase):
+    """Combining tranche rankings, reading results back from disk, and exporting hit poses."""
+
+    def setUp(self):
+        self.tmp = Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, self.tmp, ignore_errors=True)
+
+    def _tranche(self, name, rows, top_n):
+        tdir = self.tmp / "tranches" / name
+        (tdir / "results").mkdir(parents=True)
+        body = "".join(f"{lig}\t{aff:.3f}\tprotein\n" for lig, aff in rows)
+        (tdir / "results" / "ranked_all.tsv").write_text("ligand\taffinity_kcal_mol\treceptor\n" + body)
+        (tdir / "results" / "top_hits.tsv").write_text(
+            "ligand\taffinity_kcal_mol\treceptor\n" + "".join(body.splitlines(True)[:top_n]))
+        pipeline.write_status(tdir, "DONE")
+        return tdir
+
+    def test_overall_vs_per_tranche_ranking(self):
+        a = self._tranche("H10P100", [("A1", -10), ("A2", -9), ("A3", -8), ("SHARED", -7)], 1)
+        b = self._tranche("H12P100", [("SHARED", -7.5), ("B1", -6), ("B2", -5)], 1)
+
+        top = pipeline.combine_results(self.tmp, [a, b], filter_percent=50, scope="overall")
+        rows = [l.split("\t") for l in top.read_text().splitlines()[1:]]
+        self.assertEqual([r[0] for r in rows], ["A1", "A2", "A3"])  # top 50% of 6 unique ligands, all from A
+        all_rows = (self.tmp / "results" / "ranked_all_combined.tsv").read_text().splitlines()[1:]
+        self.assertEqual(len(all_rows), 6)  # SHARED counted once ...
+        self.assertIn("SHARED\t-7.500\tprotein\tH12P100", all_rows)  # ... at its best score
+
+        top = pipeline.combine_results(self.tmp, [a, b], filter_percent=50, scope="per_tranche")
+        rows = [l.split("\t") for l in top.read_text().splitlines()[1:]]
+        self.assertEqual([(r[0], r[3]) for r in rows], [("A1", "H10P100"), ("SHARED", "H12P100")])  # each tranche's best
+
+    def test_rank_scope_validated(self):
+        self.assertEqual(io_parse.rank_scope({}), "overall")
+        with self.assertRaises(ValueError):
+            io_parse.rank_scope({"rank_scope": "everything"})
+
+    def test_load_results_and_export_poses_after_a_run(self):
+        import gui
+
+        workdir = self.tmp / "run"
+        workdir.mkdir()
+        setup = io_parse.load_setup(REPO_ROOT / "setup.txt")
+        targets = io_parse.load_docking_targets(setup)
+        tranches = io_parse.load_tranches_tsv(REPO_ROOT / "tests" / "fixtures" / "tranches.txt")
+        tdir = pipeline.materialize_tranche(workdir, tranches[0], REPO_ROOT / "setup.txt")
+        pipeline.download_tranche(tdir)
+        pipeline.unpack_tranche(tdir)
+        pipeline.dock_tranche(tdir, targets, options=io_parse.load_vinalc_options(setup),
+                              vinalc_bin=str(MOCK_VINALC), mpirun_bin=None)
+        pipeline.rank_and_filter_tranche(tdir, 100)
+        pipeline.combine_results(workdir, [tdir], 100, "overall")
+
+        api = gui.PipelineAPI()  # a fresh server: no run state of its own
+        res = api.load_results(str(workdir))
+        self.assertEqual([t["status"] for t in res["tranches"]], ["DONE"])
+        self.assertEqual(len(res["top_hits"]), 2)
+        self.assertEqual(res["ranked"], 2)
+
+        exp = api.export_poses(str(workdir), str(REPO_ROOT / "setup.txt"), 2)
+        self.assertTrue(exp["ok"], exp)
+        self.assertEqual(exp["exported"], 2)
+        poses = Path(exp["folder"])
+        files = sorted(p.name for p in poses.iterdir())
+        self.assertIn("top_hits_poses.pdbqt", files)
+        self.assertIn("receptor_protein.pdbqt", files)
+        for rank, hit in enumerate(res["top_hits"], start=1):
+            text = (poses / f"{rank:03d}_{hit['ligand']}.pdbqt").read_text()
+            self.assertIn(f"REMARK  Name = {hit['ligand']}", text)  # the pose of the right ligand ...
+            self.assertIn(f"REMARK VINA RESULT: {hit['affinity']:9.1f}", text)  # ... and its best mode
+            self.assertNotIn("MODEL", text)
+        self.assertEqual((poses / "top_hits_poses.pdbqt").read_text().count("ENDMDL"), 2)
+
+    def test_export_with_no_hits_explains(self):
+        import gui
+
+        res = gui.PipelineAPI().export_poses(str(self.tmp), str(REPO_ROOT / "setup.txt"), 10)
+        self.assertFalse(res["ok"])
+        self.assertIn("No hits yet", res["message"])
+
+
 class StopResumeTest(unittest.TestCase):
     """Stopping a run ends its whole process tree, records nothing for the interrupted step, and resumes."""
 

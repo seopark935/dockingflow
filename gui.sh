@@ -6,6 +6,8 @@
 #   bash gui.sh status    is the GUI server running? print its URL
 #   bash gui.sh stop      stop the GUI server (also stops a run in progress;
 #                         starting a run again later resumes where it left off)
+#   bash gui.sh restart   stop + open: run this after 'git pull' so the server
+#                         picks up the new code (the window offers it too)
 #   bash gui.sh setup     optional: install a browser-engine window (pywebview +
 #                         Qt, into .venv) -- only needed if the server has
 #                         neither tkinter nor a web browser
@@ -42,6 +44,31 @@ start_server() {
         exit 1
     fi
     echo "Started the DockingFlow GUI server (pid $(cat "$PIDFILE"), log: $LOG)."
+}
+
+stop_server() {
+    if ! running; then
+        echo "GUI server not running."
+        rm -f "$PIDFILE"
+        return 0
+    fi
+    local pid
+    pid="$(cat "$PIDFILE")"
+    kill "$pid"
+    echo -n "Stopping the GUI server (and any run in progress)..."
+    # It stops any docking run before exiting, which can take ~10 s; wait so a
+    # following start doesn't collide with it on the port.
+    for _ in $(seq 60); do
+        kill -0 "$pid" 2>/dev/null || break
+        sleep 0.5
+    done
+    if kill -0 "$pid" 2>/dev/null; then
+        kill -9 "$pid" 2>/dev/null
+        echo " forced."
+    else
+        echo " done."
+    fi
+    rm -f "$PIDFILE"
 }
 
 no_window_help() {
@@ -116,8 +143,7 @@ Tip: 'bash gui.sh setup' installs a small desktop window instead (no admin right
 WINDOW=""
 case "${1:-open}" in
     stop)
-        if running; then kill "$(cat "$PIDFILE")"; echo "Stopped the GUI server."; else echo "Not running."; fi
-        rm -f "$PIDFILE"
+        stop_server
         ;;
     status)
         if running; then
@@ -133,8 +159,9 @@ case "${1:-open}" in
         .venv/bin/python3 -m pip install "pywebview[qt]" || exit 1
         echo "Done. Run 'bash gui.sh' to open the GUI."
         ;;
-    open|browser)
-        WINDOW="$1"
+    open|browser|restart)
+        [ "$1" = restart ] && stop_server
+        [ "$1" = browser ] && WINDOW=browser
         start_server
         if open_window; then
             echo
@@ -143,7 +170,7 @@ case "${1:-open}" in
         echo "Reopen with 'bash gui.sh'; stop everything with 'bash gui.sh stop'."
         ;;
     *)
-        echo "Usage: bash gui.sh [open|browser|status|stop|setup]"
+        echo "Usage: bash gui.sh [open|browser|restart|status|stop|setup]"
         exit 1
         ;;
 esac
