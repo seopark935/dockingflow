@@ -22,6 +22,7 @@ from __future__ import annotations
 import hmac
 import json
 import secrets
+import signal
 import socket
 import sys
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -98,8 +99,16 @@ def make_handler(api: Any, html_path: Path, token: str) -> type[BaseHTTPRequestH
     return Handler
 
 
-def serve(api: Any, html_path: Path, host: str = "127.0.0.1", port: int = 8765) -> None:
-    """Serve the GUI until interrupted. Prints the access URL and SSH-tunnel command."""
+def _interrupt(signum, frame) -> None:
+    raise KeyboardInterrupt
+
+
+def serve(api: Any, html_path: Path, host: str = "127.0.0.1", port: int = 8765,
+          on_shutdown: Any = None) -> None:
+    """Serve the GUI until interrupted (Ctrl-C, SIGTERM, or SIGHUP unless nohup'd). Prints the access URL and SSH-tunnel command.
+
+    `on_shutdown`, if given, is called before exiting (e.g. to stop a run in progress).
+    """
     token = secrets.token_urlsafe(16)
     try:
         server = ThreadingHTTPServer((host, port), make_handler(api, html_path, token))
@@ -119,9 +128,17 @@ def serve(api: Any, html_path: Path, host: str = "127.0.0.1", port: int = 8765) 
         print(f"  DOCKINGFLOW_URL=http://{hostname}:{port}/?token={token}", flush=True)
     print("Runs keep going if the browser or tunnel closes; stopping this process stops them.", flush=True)
 
+    signal.signal(signal.SIGTERM, _interrupt)
+    # SIGHUP (terminal closed) only when it isn't ignored: gui.sh starts the server under nohup
+    # precisely so it - and any run - survives closing MobaXterm.
+    if signal.getsignal(signal.SIGHUP) is not signal.SIG_IGN:
+        signal.signal(signal.SIGHUP, _interrupt)
     try:
         server.serve_forever()
     except KeyboardInterrupt:
         pass
     finally:
         server.server_close()
+        if on_shutdown:
+            print("Shutting down: stopping any run in progress...", flush=True)
+            on_shutdown()

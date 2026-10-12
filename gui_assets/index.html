@@ -338,6 +338,8 @@
   .status-dot.running { background: var(--blue); animation: pulse 1.2s infinite; }
   .status-dot.done { background: var(--green); }
   .status-dot.error { background: var(--red); }
+  .status-dot.stopping { background: var(--amber); animation: pulse 1.2s infinite; }
+  .status-dot.stopped { background: var(--amber); }
 
   @keyframes pulse {
     0%, 100% { opacity: 1; }
@@ -441,6 +443,7 @@
       <div class="btn-row">
         <button onclick="validate()">Validate</button>
         <button class="primary" id="runBtn" onclick="startRun()">Run pipeline</button>
+        <button class="danger" id="stopBtn" onclick="stopRun()" disabled>Stop</button>
       </div>
       <div id="banner">Fill in the fields above, or use the defaults already loaded, then click Validate.</div>
       <div class="btn-row">
@@ -811,6 +814,15 @@ async function startRun() {
   if (!polling) polling = setInterval(pollStatus, 700);
 }
 
+async function stopRun() {
+  if (!confirm('Stop the pipeline now?\n\nEverything already finished is kept. The step in progress is ' +
+               'cancelled and redone from its start when you click Resume.')) return;
+  const res = await api().stop_run();
+  if (!res.ok) { setBanner(res.message, 'err'); return; }
+  document.getElementById('stopBtn').disabled = true;
+  setBanner('Stopping: ending the current step (up to ~10 seconds)...', 'info');
+}
+
 async function cleanWorkdir() {
   const c = currentConfig();
   if (!confirm(`Delete generated tranche outputs under:\n${c.workdir}\n\nThe workdir itself is kept.`)) return;
@@ -888,8 +900,17 @@ async function pollStatus() {
   const dot = document.getElementById('statusDot');
   const runBtn = document.getElementById('runBtn');
 
-  if (s.phase === 'running') {
-    dot.className = 'status-dot running';
+  const runBtnEl = document.getElementById('runBtn');
+  document.getElementById('stopBtn').disabled = s.phase !== 'running';
+  runBtnEl.textContent = s.phase === 'stopped' ? 'Resume' : 'Run pipeline';
+  if (s.phase === 'running' || s.phase === 'stopping') {
+    dot.className = `status-dot ${s.phase}`;
+    runBtn.disabled = true;
+  } else if (s.phase === 'stopped') {
+    dot.className = 'status-dot stopped';
+    setBanner(s.message, 'info');
+    runBtn.disabled = false;
+    clearInterval(polling); polling = null;
   } else if (s.phase === 'done') {
     dot.className = 'status-dot done';
     setBanner(s.message, 'ok');
@@ -922,7 +943,7 @@ window.addEventListener('pywebviewready', async () => {
     document.getElementById('runBtn').disabled = s.phase === 'running';
     if (s.phase === 'running') setBanner('A run is in progress on this machine; showing its live status.', 'info');
     pollStatus();
-    if (s.phase === 'running' && !polling) polling = setInterval(pollStatus, 700);
+    if ((s.phase === 'running' || s.phase === 'stopping') && !polling) polling = setInterval(pollStatus, 700);
   }
 });
 

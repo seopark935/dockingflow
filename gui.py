@@ -96,7 +96,7 @@ class RunState:
     stale state from a previous run never leaks into a new one.
     """
 
-    phase: str = "idle"  # idle | running | done | error
+    phase: str = "idle"  # idle | running | stopping | stopped | done | error
     message: str = ""
     log: list[str] = field(default_factory=list)
     tranches: list[TrancheProgress] = field(default_factory=list)
@@ -502,7 +502,11 @@ class PipelineAPI:
         with self._lock:
             if self._state.phase == "running":
                 return {"ok": False, "message": "A run is already in progress."}
-            self._state = RunState(phase="running", message="Starting...")
+            if self._state.phase == "stopping":
+                return {"ok": False, "message": "The previous run is still stopping; try again in a few seconds."}
+            resuming = self._state.phase == "stopped"
+            self._state = RunState(phase="running", message="Resuming..." if resuming else "Starting...")
+            pipeline.CONTROL.reset()
 
         thread = threading.Thread(
             target=self._run,
@@ -510,6 +514,23 @@ class PipelineAPI:
             daemon=True,
         )
         thread.start()
+        return {"ok": True}
+
+    def stop_run(self) -> dict[str, Any]:
+        """Stop the run in progress: end its current step (and all its processes), keep everything finished.
+
+        Returns immediately; the phase goes "stopping" -> "stopped" once the
+        current step's processes have exited (up to ~10 s). Starting a run
+        again resumes: finished tranches and stages are skipped, and the
+        interrupted stage is redone from its beginning.
+        """
+        with self._lock:
+            if self._state.phase != "running":
+                return {"ok": False, "message": "No run is in progress."}
+            self._state.phase = "stopping"
+            self._state.message = "Stopping: ending the current step..."
+            self._state.log_line("Stop requested: ending the current step...")
+        threading.Thread(target=pipeline.CONTROL.stop, daemon=True).start()
         return {"ok": True}
 
     def _run(
@@ -564,40 +585,71 @@ class PipelineAPI:
             filter_percent = float(setup["filter_percent"])
             mpirun = None if no_mpirun else mpirun_bin
 
-            for tdir, prog in zip(tdirs, state.tranches):
-                try:
-                    state.log_line(f"[{prog.label}] downloading...")
-                    pipeline.download_tranche(tdir)
-                    prog.status = pipeline.read_status(tdir)
+            check = pipeline.CONTROL.check
+            stage = ""
+            current: TrancheProgress | None = None
+            try:
+                for tdir, prog in zip(tdirs, state.tranches):
+                    current = prog
+                    try:
+                        stage = "download"
+                        check()
+                        state.log_line(f"[{prog.label}] downloading...")
+                        pipeline.download_tranche(tdir)
+                        prog.status = pipeline.read_status(tdir)
 
-                    state.log_line(f"[{prog.label}] unpacking...")
-                    pipeline.unpack_tranche(tdir)
-                    prog.status = pipeline.read_status(tdir)
+                        stage = "unpack"
+                        check()
+                        state.log_line(f"[{prog.label}] unpacking...")
+                        pipeline.unpack_tranche(tdir)
+                        prog.status = pipeline.read_status(tdir)
 
-                    state.log_line(f"[{prog.label}] docking...")
-                    pipeline.dock_tranche(
-                        tdir,
-                        targets,
-                        options=options,
-                        vinalc_bin=vinalc_bin,
-                        mpirun_bin=mpirun,
-                    )
-                    prog.status = pipeline.read_status(tdir)
+                        stage = "dock"
+                        check()
+                        state.log_line(f"[{prog.label}] docking...")
+                        pipeline.dock_tranche(
+                            tdir,
+                            targets,
+                            options=options,
+                            vinalc_bin=vinalc_bin,
+                            mpirun_bin=mpirun,
+                        )
+                        prog.status = pipeline.read_status(tdir)
 
-                    state.log_line(f"[{prog.label}] ranking...")
-                    pipeline.rank_and_filter_tranche(tdir, filter_percent)
-                    prog.status = pipeline.read_status(tdir)
-                    state.log_line(f"[{prog.label}] done.")
-                except Exception as exc:
-                    prog.status = pipeline.read_status(tdir)
-                    prog.error = str(exc)
-                    state.log_line(f"[{prog.label}] FAILED: {exc}")
-                    continue  # isolate failures: one bad tranche shouldn't kill the whole run
+                        stage = "rank"
+                        check()
+                        state.log_line(f"[{prog.label}] ranking...")
+                        pipeline.rank_and_filter_tranche(tdir, filter_percent)
+                        prog.status = pipeline.read_status(tdir)
+                        state.log_line(f"[{prog.label}] done.")
+                    except Exception as exc:
+                        prog.status = pipeline.read_status(tdir)
+                        prog.error = str(exc)
+                        state.log_line(f"[{prog.label}] FAILED: {exc}")
+                        continue  # isolate failures: one bad tranche shouldn't kill the whole run
+                check()
+            except pipeline.StopRequested:
+                # Nothing about the interrupted stage was recorded, so its tranche is still at its
+                # last completed stage and that stage reruns from scratch on resume.
+                if current is not None:
+                    current.status = pipeline.read_status(tdirs[state.tranches.index(current)])
+                    state.log_line(f"[{current.label}] stopped during {stage}; that step restarts when you resume.")
+                combined_path = pipeline.combine_results(workdir_p, tdirs)  # hits from finished tranches
+                state.top_hits = self._read_top_hits(combined_path)
+                done = sum(1 for t in state.tranches if t.status == "DONE")
+                state.phase = "stopped"
+                state.message = (f"Stopped ({done} of {len(state.tranches)} tranche(s) done). Click Resume to "
+                                 "continue where it left off; finished work is kept.")
+                state.log_line("Stopped.")
+                return
 
             combined_path = pipeline.combine_results(workdir_p, tdirs)
             state.top_hits = self._read_top_hits(combined_path)
             state.phase = "done"
             state.message = f"Finished. Combined results: {combined_path}"
+        except pipeline.StopRequested:  # stopped before any tranche started (e.g. during setup)
+            state.phase = "stopped"
+            state.message = "Stopped before any work started."
         except Exception as exc:
             state.phase = "error"
             state.message = str(exc)
@@ -745,7 +797,9 @@ def main() -> None:
     if args.web:
         import web_server
 
-        web_server.serve(api, html_path, host=args.host, port=args.port)
+        # Stopping the server (`bash gui.sh stop`, Ctrl-C, or the SSH session ending) also stops any
+        # run cleanly: its processes run in their own process groups and would otherwise be orphaned.
+        web_server.serve(api, html_path, host=args.host, port=args.port, on_shutdown=pipeline.CONTROL.stop)
         return
 
     import webview

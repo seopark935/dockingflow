@@ -103,7 +103,15 @@ before pointing it at a real screen.
      CPU/memory budget are saved to the settings file (`project/setup.txt`)
      first, so the command line uses the same values. Progress, the log,
      and the top hits update live on the right.
-3. Close the window or MobaXterm whenever you like: the run keeps going on
+3. **Stop / Resume:** the **Stop** button (next to Run) stops a run at any
+   point, ending all of its processes, including every VinaLC MPI rank.
+   Everything finished is kept; the step that was in progress is redone
+   from its start when you click **Resume** (the Run button, renamed), so a
+   tranche interrupted mid-docking re-docks from the beginning, and
+   finished tranches are skipped. The same applies on the command line:
+   Ctrl-C (or `kill`) stops cleanly, and re-running the same command
+   resumes.
+4. Close the window or MobaXterm whenever you like: the run keeps going on
    the server. Run `bash gui.sh` again later to reopen the window and see
    live progress. `bash gui.sh stop` stops the GUI server (and any run in
    progress — re-running resumes where it stopped).

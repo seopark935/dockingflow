@@ -8,8 +8,10 @@ from __future__ import annotations
 
 import gzip
 import json
+import os
 import shutil
 import threading
+import time
 import urllib.error
 import urllib.request
 import subprocess
@@ -182,6 +184,101 @@ class DockingFlowEndToEndTest(unittest.TestCase):
 
         self.assertFalse((self.workdir / "tranches").exists())
         self.assertTrue((self.workdir / "unrelated.txt").exists())
+
+
+def _alive(pid: int) -> bool:
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    return True
+
+
+def _wait_until(pred, timeout: float = 20.0) -> bool:
+    end = time.time() + timeout
+    while time.time() < end:
+        if pred():
+            return True
+        time.sleep(0.1)
+    return False
+
+
+class StopResumeTest(unittest.TestCase):
+    """Stopping a run ends its whole process tree, records nothing for the interrupted step, and resumes."""
+
+    def setUp(self):
+        self.tmp = Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, self.tmp, ignore_errors=True)
+        pipeline.CONTROL.reset()
+        self.addCleanup(pipeline.CONTROL.reset)
+        self.child_pidfile = self.tmp / "child.pid"
+        # A "VinaLC" that hangs, with a background child of its own (like mpirun's ranks).
+        self.slow_vinalc = self.tmp / "slow_vinalc"
+        self.slow_vinalc.write_text(f"#!/bin/sh\nsleep 300 &\necho $! > {self.child_pidfile}\nwait\n")
+        self.slow_vinalc.chmod(0o755)
+
+    def test_stop_ends_whole_process_group(self):
+        errors = []
+
+        def target():
+            try:
+                pipeline.run_cmd([str(self.slow_vinalc)], self.tmp, self.tmp / "o.log", self.tmp / "e.log")
+            except pipeline.StopRequested:
+                errors.append("stopped")
+
+        t = threading.Thread(target=target)
+        t.start()
+        self.assertTrue(_wait_until(lambda: self.child_pidfile.exists() and self.child_pidfile.read_text().strip()))
+        child = int(self.child_pidfile.read_text())
+        pipeline.CONTROL.stop()
+        t.join(15)
+        self.assertEqual(errors, ["stopped"])
+        self.assertTrue(_wait_until(lambda: not _alive(child), 5), "child process survived the stop")
+
+    def test_gui_stop_then_resume(self):
+        import gui
+
+        api = gui.PipelineAPI()
+        workdir = self.tmp / "run"
+        args = [str(REPO_ROOT / "setup.txt"), str(REPO_ROOT / "tests" / "fixtures" / "tranches.txt"), str(workdir)]
+        self.assertTrue(api.start_run(*args, str(self.slow_vinalc), "mpirun", True)["ok"])
+        self.assertTrue(_wait_until(lambda: self.child_pidfile.exists() and self.child_pidfile.read_text().strip()))
+        child = int(self.child_pidfile.read_text())
+
+        self.assertFalse(api.start_run(*args, str(MOCK_VINALC), "mpirun", True)["ok"])  # already running
+        t0 = time.time()
+        self.assertTrue(api.stop_run()["ok"])
+        self.assertTrue(_wait_until(lambda: api.get_status()["phase"] == "stopped", 15))
+        self.assertLess(time.time() - t0, 12)
+        status = api.get_status()
+        self.assertEqual(status["tranches"][0]["status"], "UNPACKED")  # docking not recorded as done or failed
+        self.assertIsNone(status["tranches"][0]["error"])
+        self.assertTrue(_wait_until(lambda: not _alive(child), 5))
+        self.assertFalse(api.stop_run()["ok"])  # nothing left to stop
+
+        self.assertTrue(api.start_run(*args, str(MOCK_VINALC), "mpirun", True)["ok"])  # resume
+        self.assertTrue(_wait_until(lambda: api.get_status()["phase"] == "done", 30))
+        self.assertEqual(api.get_status()["tranches"][0]["status"], "DONE")
+
+    def test_cli_sigterm_stops_cleanly(self):
+        import signal
+        import subprocess
+
+        workdir = self.tmp / "cli"
+        proc = subprocess.Popen(
+            [sys.executable, str(REPO_ROOT / "pipeline.py"), "--map", str(REPO_ROOT / "tests" / "fixtures" / "tranches.txt"),
+             "--setup", str(REPO_ROOT / "setup.txt"), "--workdir", str(workdir), "--vinalc-bin", str(self.slow_vinalc),
+             "--no-mpirun"],
+            stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True,
+        )
+        self.assertTrue(_wait_until(lambda: self.child_pidfile.exists() and self.child_pidfile.read_text().strip()))
+        child = int(self.child_pidfile.read_text())
+        proc.send_signal(signal.SIGTERM)
+        out, _ = proc.communicate(timeout=20)
+        self.assertEqual(proc.returncode, 130, out)
+        self.assertIn("Re-run the same command to resume", out)
+        self.assertTrue(_wait_until(lambda: not _alive(child), 5))
+        self.assertEqual(pipeline.read_status(workdir / "tranches" / "LP5_MW200"), "UNPACKED")
 
 
 class VinaLCFailureTest(unittest.TestCase):

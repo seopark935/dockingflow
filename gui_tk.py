@@ -59,6 +59,7 @@ STATUS_TEXT = {
 PHASE_PILL = {  # run phase -> (text, fg, bg)
     "idle": ("Idle", P["muted"], P["neutral_bg"]), "running": ("Running", P["info"], P["info_bg"]),
     "done": ("Finished", P["ok"], P["ok_bg"]), "error": ("Error", P["err"], P["err_bg"]),
+    "stopping": ("Stopping...", P["err"], P["err_bg"]), "stopped": ("Stopped", P["muted"], P["neutral_bg"]),
 }
 
 CHARGES = {"J": "-4", "K": "-3", "L": "-2", "M": "-1", "N": "0", "O": "+1", "P": "+2", "Q": "+3", "R": "+4"}
@@ -459,6 +460,8 @@ class DockingFlowApp(tk.Tk):
         ttk.Button(row, text="Validate", command=self.validate).pack(side=tk.LEFT)
         self.run_btn = ttk.Button(row, text="Run pipeline", style="Accent.TButton", command=self.start_run)
         self.run_btn.pack(side=tk.LEFT, padx=6)
+        self.stop_btn = ttk.Button(row, text="Stop", style="Danger.TButton", command=self.stop_run, state=tk.DISABLED)
+        self.stop_btn.pack(side=tk.LEFT)
         ttk.Button(row, text="Nuke", style="Danger.TButton", command=self.nuke).pack(side=tk.RIGHT)
         ttk.Button(row, text="Clean", command=self.clean).pack(side=tk.RIGHT, padx=6)
         self.message = tk.Label(actions, text="Loading...", wraplength=360, justify=tk.LEFT, anchor="w",
@@ -715,8 +718,8 @@ class DockingFlowApp(tk.Tk):
         if s:
             if s["phase"] == "running":
                 self.set_message("A run is in progress on the server; showing its live status.", "info")
-            elif s["phase"] in ("done", "error"):
-                self.set_message(s["message"], "ok" if s["phase"] == "done" else "err")
+            elif s["phase"] in ("done", "error", "stopped"):
+                self.set_message(s["message"], {"done": "ok", "error": "err", "stopped": "info"}[s["phase"]])
             else:
                 self.set_message("New here? Click 'How to use' (top right), then work through tabs 1-4 "
                                  "and click Validate. Every '?' explains that setting.")
@@ -1138,7 +1141,26 @@ class DockingFlowApp(tk.Tk):
         if not res["ok"]:
             self.set_message(res["message"], "err")
             return
-        self.set_message("Run started. You can close this window; the run continues on the server.", "info")
+        self.set_message("Run started. You can close this window; the run continues on the server. "
+                         "Stop pauses it; Resume continues where it left off.", "info")
+        self.poll()
+
+    def stop_run(self) -> None:
+        if not messagebox.askyesno(
+            "Stop the run?",
+            "Stop the pipeline now?\n\n"
+            "Everything already finished is kept. The step in progress is cancelled and redone from its start "
+            "when you click Resume (for docking, that tranche's docking restarts; finished tranches are skipped).",
+        ):
+            return
+        res = self.call("stop_run")
+        if res is None:
+            return
+        if not res["ok"]:
+            self.set_message(res["message"], "err")
+            return
+        self.set_message("Stopping: ending the current step (up to ~10 seconds)...", "info")
+        self.stop_btn.configure(state=tk.DISABLED)
         self.poll()
 
     def clean(self) -> None:
@@ -1209,7 +1231,12 @@ class DockingFlowApp(tk.Tk):
 
         if s["phase"] != last.get("phase"):
             self.set_phase(s["phase"])
-            self.run_btn.configure(state=tk.DISABLED if s["phase"] == "running" else tk.NORMAL)
+            busy = s["phase"] in ("running", "stopping")
+            self.run_btn.configure(state=tk.DISABLED if busy else tk.NORMAL,
+                                   text="Resume" if s["phase"] == "stopped" else "Run pipeline")
+            self.stop_btn.configure(state=tk.NORMAL if s["phase"] == "running" else tk.DISABLED)
+            if last and s["phase"] == "stopped":
+                self.set_message(s["message"], "info")
             if last and s["phase"] == "done":
                 failed = [t["label"] for t in s["tranches"] if t["status"].startswith("FAILED")]
                 if failed:

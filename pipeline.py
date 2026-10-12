@@ -25,10 +25,13 @@ from __future__ import annotations
 
 import argparse
 import gzip
+import os
 import re
 import shutil
+import signal
 import subprocess
 import tarfile
+import threading
 import time
 import zlib
 from datetime import datetime
@@ -93,6 +96,79 @@ def write_status(tdir: Path, status: str) -> None:
     write_text(tdir / "status.txt", status + "\n")
 
 
+class StopRequested(BaseException):
+    """Raised inside a stage when the run is being stopped (see `RunControl`).
+
+    A `BaseException`, like `KeyboardInterrupt`, so the per-tranche
+    `except Exception` failure handling never mistakes a stop for a failed
+    tranche. A stage interrupted this way never writes its status, so the
+    tranche stays at its last *completed* stage and the interrupted stage
+    is redone from its start on the next run.
+    """
+
+
+class RunControl:
+    """Lets another thread (the GUI's Stop button) stop a run in progress.
+
+    Every external command runs in its own process group (see `run_cmd`),
+    so stopping signals the whole tree at once — the curl script and its
+    curls, or mpirun and every VinaLC rank — rather than leaving orphaned
+    ranks burning CPU.
+    """
+
+    GRACE_SECONDS = 10  # SIGTERM first, then SIGKILL whatever is left
+
+    def __init__(self) -> None:
+        self._stop = threading.Event()
+        self._lock = threading.Lock()
+        self._proc: subprocess.Popen | None = None
+
+    def reset(self) -> None:
+        self._stop.clear()
+
+    @property
+    def stop_requested(self) -> bool:
+        return self._stop.is_set()
+
+    def check(self) -> None:
+        """Raise `StopRequested` if a stop has been requested; called between units of work."""
+        if self._stop.is_set():
+            raise StopRequested()
+
+    def stop(self) -> None:
+        """Request a stop and terminate the running command's whole process tree. Blocks up to GRACE_SECONDS."""
+        self._stop.set()
+        with self._lock:
+            proc = self._proc
+        if proc is not None:
+            terminate_tree(proc, self.GRACE_SECONDS)
+
+    def _set_proc(self, proc: subprocess.Popen | None) -> None:
+        with self._lock:
+            self._proc = proc
+
+
+# The pipeline's single run control: one run per process (CLI or GUI server).
+CONTROL = RunControl()
+
+
+def terminate_tree(proc: subprocess.Popen, grace: float) -> None:
+    """SIGTERM `proc`'s process group, then SIGKILL it if still alive after `grace` seconds."""
+    if proc.poll() is not None:
+        return
+    try:
+        os.killpg(proc.pid, signal.SIGTERM)
+    except (ProcessLookupError, PermissionError):
+        return
+    try:
+        proc.wait(timeout=grace)
+    except subprocess.TimeoutExpired:
+        try:
+            os.killpg(proc.pid, signal.SIGKILL)
+        except ProcessLookupError:
+            pass
+
+
 def run_cmd(cmd: list[str], cwd: Path, stdout_path: Path, stderr_path: Path) -> tuple[int, float]:
     """Run `cmd` as a subprocess, redirecting stdout/stderr to files on disk.
 
@@ -100,6 +176,11 @@ def run_cmd(cmd: list[str], cwd: Path, stdout_path: Path, stderr_path: Path) -> 
     (vinalc/mpirun invocation), so every external process this pipeline
     shells out to gets its own timed, on-disk log pair for post-mortem
     debugging.
+
+    The command runs in its own process group so `CONTROL.stop()` can end
+    it and all its children together. If a stop is requested while it runs
+    (or this thread is interrupted, e.g. Ctrl-C in the CLI), the whole
+    group is terminated and `StopRequested` / the interrupt propagates.
 
     Args:
         cmd: Argv list passed straight to `subprocess.Popen` (no shell).
@@ -109,14 +190,26 @@ def run_cmd(cmd: list[str], cwd: Path, stdout_path: Path, stderr_path: Path) -> 
 
     Returns:
         A `(returncode, elapsed_seconds)` tuple.
+
+    Raises:
+        StopRequested: If the run was stopped while (or before) the command ran.
     """
+    CONTROL.check()
     stdout_path.parent.mkdir(parents=True, exist_ok=True)
     stderr_path.parent.mkdir(parents=True, exist_ok=True)
 
     t0 = time.time()
     with open(stdout_path, "w", encoding="utf-8") as out, open(stderr_path, "w", encoding="utf-8") as err:
-        proc = subprocess.Popen(cmd, cwd=str(cwd), stdout=out, stderr=err, text=True)
-        rc = proc.wait()
+        proc = subprocess.Popen(cmd, cwd=str(cwd), stdout=out, stderr=err, text=True, start_new_session=True)
+        CONTROL._set_proc(proc)
+        try:
+            rc = proc.wait()
+        except BaseException:
+            terminate_tree(proc, RunControl.GRACE_SECONDS)
+            raise
+        finally:
+            CONTROL._set_proc(None)
+    CONTROL.check()  # killed by a stop: don't let the caller record a result
     return rc, time.time() - t0
 
 
@@ -412,6 +505,7 @@ def unpack_tranche(tdir: Path) -> Path:
         index.write("index\tligand\tsource\n")
         try:
             for archive in archives:
+                CONTROL.check()
                 try:
                     for source_name, text in iter_pdbqt_texts(archive):
                         for name, lines in split_molecules(source_name, text):
@@ -795,8 +889,26 @@ def nuke_workdir(workdir: Path) -> None:
 # Main
 # ----------------------------
 
+def _interrupt(signum, frame) -> None:
+    """Treat SIGTERM like Ctrl-C, so `kill <pid>` also stops the run cleanly."""
+    raise KeyboardInterrupt
+
+
 def main() -> int:
-    """CLI entry point: parse arguments and run the pipeline stages in order.
+    """CLI entry point. Ctrl-C (or SIGTERM) stops the run cleanly: the running
+    command's whole process tree is ended, and re-running the same command
+    resumes where it stopped."""
+    signal.signal(signal.SIGTERM, _interrupt)
+    try:
+        return _main()
+    except (KeyboardInterrupt, StopRequested):
+        CONTROL.stop()
+        print("\nStopped. Re-run the same command to resume; finished tranches and stages are skipped.")
+        return 130
+
+
+def _main() -> int:
+    """Parse arguments and run the pipeline stages in order.
 
     Like the GUI's runner (`gui.PipelineAPI._run`), a tranche that fails a
     stage is reported and skipped for the remaining stages while the other
