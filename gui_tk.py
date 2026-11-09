@@ -22,9 +22,11 @@ Usage (normally via `bash gui.sh`):
 from __future__ import annotations
 
 import json
+import queue
 import subprocess
 import sys
 import threading
+import traceback
 import tkinter as tk
 import tkinter.font as tkfont
 import urllib.error
@@ -38,6 +40,7 @@ from chembl import LIGAND_PRESETS as CHEMBL_PRESETS
 from zinc22 import CHARGE_PRESETS, LIGAND_PRESETS, LOGP_BINS, HAC_MAX, HAC_MIN
 
 POLL_MS = 1000
+ASYNC_POLL_MS = 100  # how often the GUI thread checks for finished background calls
 MAX_HIT_ROWS = 500  # the full list is in top_hits_combined.tsv
 LARGE_SCREEN = 5_000_000  # molecules; above this, confirm before building the list
 DA_PER_HEAVY_ATOM = 14  # rough average for drug-like molecules, for the "~ Da" hint
@@ -365,9 +368,13 @@ class DockingFlowApp(tk.Tk):
         self._plan_job = None
         self._poll_job = None
         self._async_gen: Dict[str, int] = {}  # newest-wins bookkeeping for call_async
+        self._async_results: "queue.Queue[tuple]" = queue.Queue()
+        self._async_job = None
+        self._last_summary: Optional[Dict[str, Any]] = None  # newest compound count, for the build confirmation
         self._last_status: Dict[str, Any] = {}
 
         self._build()
+        self._pump_async()  # start draining async results on the GUI thread
         self.apply_preset()
         self.after(50, self._startup)
 
@@ -403,9 +410,13 @@ class DockingFlowApp(tk.Tk):
     def call_async(self, name: str, *args: Any, then: Callable[[Any], None], channel: str = "") -> None:
         """Run a slow call on a worker thread and hand the result to `then` on the GUI thread.
 
+        Tk is not thread-safe, so the worker touches no widgets and does
+        not even schedule the callback itself: it puts the result on a
+        queue that `_pump_async` (running on the GUI thread) drains.
+
         Only the newest call per `channel` is delivered, so a burst of
-        edits (each triggering a recount) can't have an old answer land on
-        top of a newer one.
+        edits — each triggering a recount — can't have an old answer land
+        on top of a newer one.
         """
         chan = channel or name
         generation = self._async_gen.get(chan, 0) + 1
@@ -413,16 +424,26 @@ class DockingFlowApp(tk.Tk):
 
         def work() -> None:
             res, err = self._call_raw(name, *args)
-            self.after(0, lambda: self._deliver(chan, generation, res, err, then))
+            self._async_results.put((chan, generation, res, err, then))
 
         threading.Thread(target=work, daemon=True).start()
 
-    def _deliver(self, chan: str, generation: int, res: Any, err: Optional[str], then: Callable) -> None:
-        if generation != self._async_gen.get(chan):
-            return  # superseded by a newer call on this channel
-        if err:
-            self.set_message(err, "err")
-        then(res)
+    def _pump_async(self) -> None:
+        """Deliver finished `call_async` results. Runs on the GUI thread, forever."""
+        try:
+            while True:
+                chan, generation, res, err, then = self._async_results.get_nowait()
+                if generation != self._async_gen.get(chan):
+                    continue  # superseded by a newer call on this channel
+                if err:
+                    self.set_message(err, "err")
+                try:
+                    then(res)
+                except Exception:  # a broken callback must not kill the pump
+                    traceback.print_exc()
+        except queue.Empty:
+            pass
+        self._async_job = self.after(ASYNC_POLL_MS, self._pump_async)
 
     def check_server_version(self) -> bool:
         """Offer to restart a GUI server that predates the code on disk. Returns False if restarting."""
@@ -448,6 +469,17 @@ class DockingFlowApp(tk.Tk):
 
     def set_message(self, text: str, kind: str = "") -> None:
         self.message.configure(text=text, fg=P["text"] if not kind else COLORS[kind], bg=MESSAGE_BG.get(kind, P["neutral_bg"]))
+
+    def destroy(self) -> None:
+        """Cancel our repeating timers first, so closing the window doesn't log stray callbacks."""
+        for job in (self._async_job, self._poll_job, self._plan_job, self._zinc_job):
+            if job:
+                try:
+                    self.after_cancel(job)
+                except Exception:
+                    pass
+        self._async_job = self._poll_job = self._plan_job = self._zinc_job = None
+        super().destroy()
 
     # ---------- look ----------
 
@@ -1027,6 +1059,7 @@ class DockingFlowApp(tk.Tk):
         self.chembl_ranges_changed(from_preset=True)
 
     def chembl_ranges_changed(self, from_preset: bool = False) -> None:
+        self._last_summary = None
         if not from_preset and not self._applying_preset:
             self.chembl_preset.set(CUSTOM)
             self.chembl_note.configure(text="Custom selection.")
@@ -1058,14 +1091,18 @@ class DockingFlowApp(tk.Tk):
             return
         self.zinc_count.configure(text="Counting...")
         self.zinc_label.configure(text="(asking ChEMBL; wide filters can take up to a minute)")
-        self.update_idletasks()
-        res = self.call("chembl_summary", filters)
+        self.call_async("chembl_summary", filters, then=self._show_chembl_summary, channel="summary")
+
+    def _show_chembl_summary(self, res: Optional[Dict[str, Any]]) -> None:
         if res is None:
+            self.zinc_count.configure(text="Couldn't count")
+            self.zinc_label.configure(text="No answer from the GUI server.")
             return
         if not res["ok"]:
             self.zinc_count.configure(text="Couldn't count")
             self.zinc_label.configure(text=res["message"])
             return
+        self._last_summary = res
         n = res["molecules"]
         self.zinc_count.configure(text=f"~{n:,} compounds")
         if res.get("whole_release"):
@@ -1086,17 +1123,19 @@ class DockingFlowApp(tk.Tk):
             self.set_message("Check the ChEMBL filters: weight and logP must be numbers, each 'from' <= its 'to'.",
                              "err")
             return
-        summary = self.call("chembl_summary", filters)
-        if summary and summary.get("ok") and summary["molecules"] > LARGE_SCREEN and not messagebox.askyesno(
+        n = (self._last_summary or {}).get("molecules")
+        if n and n > LARGE_SCREEN and not messagebox.askyesno(
             "Large screen",
-            f"This selection is about {summary['molecules']:,} compounds.\n\n"
+            f"This selection is about {n:,} compounds.\n\n"
             "Each one is converted to 3D and then docked, which takes a very long time and a lot of disk. "
             "Create the list anyway?",
         ):
             return
-        self.set_message("Asking ChEMBL for the compound list...", "info")
-        self.update_idletasks()
-        res = self.call("chembl_build", filters)
+        self.set_message("Asking ChEMBL for the compound list... (the window stays usable)", "info")
+        self.call_async("chembl_build", filters, then=self._built, channel="build")
+
+    def _built(self, res: Optional[Dict[str, Any]]) -> None:
+        """Result of building a tranche list, from either source."""
         if res is None:
             return
         if res["ok"]:
@@ -1106,10 +1145,8 @@ class DockingFlowApp(tk.Tk):
 
     def check_obabel(self) -> None:
         self.set_message("Checking Open Babel...", "info")
-        self.update_idletasks()
-        res = self.call("check_obabel", self.v["setup_path"].get())
-        if res:
-            self.set_message(res["message"], "ok" if res["ok"] else "err")
+        self.call_async("check_obabel", self.v["setup_path"].get(),
+                        then=lambda r: r and self.set_message(r["message"], "ok" if r["ok"] else "err"))
 
     # ---------- ligand library: presets + ranges + charges ----------
 
@@ -1146,6 +1183,7 @@ class DockingFlowApp(tk.Tk):
             self.ranges_changed()
 
     def ranges_changed(self, from_preset: bool = False) -> None:
+        self._last_summary = None
         if not from_preset and not self._applying_preset:
             self.preset.set(CUSTOM)
             self.preset_note.configure(text="Custom selection.")
@@ -1188,14 +1226,18 @@ class DockingFlowApp(tk.Tk):
             return
         self.zinc_count.configure(text="Counting...")
         self.zinc_label.configure(text="(the first time downloads ZINC22's index, ~10 MB)")
-        self.update_idletasks()
-        res = self.call("zinc_summary", filters)
+        self.call_async("zinc_summary", filters, then=self._show_zinc_summary, channel="summary")
+
+    def _show_zinc_summary(self, res: Optional[Dict[str, Any]]) -> None:
         if res is None:
+            self.zinc_count.configure(text="Couldn't count")
+            self.zinc_label.configure(text="No answer from the GUI server.")
             return
         if not res["ok"]:
             self.zinc_count.configure(text="Couldn't count")
             self.zinc_label.configure(text=res["message"])
             return
+        self._last_summary = res
         n = res["molecules"]
         self.zinc_count.configure(text=f"~{n:,} molecules")
         note = f"in {res['tranches']:,} tranche(s)."
@@ -1208,21 +1250,15 @@ class DockingFlowApp(tk.Tk):
         if filters is None:
             self.set_message("Check the ligand ranges: each 'from' must be <= its 'to', with at least one charge.", "err")
             return
-        summary = self.call("zinc_summary", filters)
-        if summary and summary.get("ok") and summary["molecules"] > LARGE_SCREEN and not messagebox.askyesno(
+        summary = self._last_summary or {}
+        if summary.get("molecules", 0) > LARGE_SCREEN and not messagebox.askyesno(
             "Large screen",
-            f"This selection is about {summary['molecules']:,} molecules in {summary['tranches']:,} tranches.\n\n"
-            "Docking that many takes a very long time and a lot of disk. Create the list anyway?",
+            f"This selection is about {summary['molecules']:,} molecules in {summary.get('tranches', 0):,} "
+            "tranches.\n\nDocking that many takes a very long time and a lot of disk. Create the list anyway?",
         ):
             return
-        self.set_message("Getting the file list from ZINC22...", "info")
-        self.update_idletasks()
-        res = self.call("zinc_build", filters)
-        if res is None:
-            return
-        if res["ok"]:
-            self.v["map_path"].set(res["map_path"])
-        self.set_message(res["message"] + (" Next: tab 2, Targets." if res["ok"] else ""), "ok" if res["ok"] else "err")
+        self.set_message("Getting the file list from ZINC22... (the window stays usable)", "info")
+        self.call_async("zinc_build", filters, then=self._built, channel="build")
 
     # ---------- file pickers + ZINC import ----------
 
@@ -1246,14 +1282,18 @@ class DockingFlowApp(tk.Tk):
             filetypes=[("Download scripts", "*.curl *.wget *.aws *.txt"), ("All files", "*")])
         if not path:
             return
-        res = self.call("import_zinc_downloader", path)
-        if res is None:
-            return
-        if res["ok"]:
-            self.v["map_path"].set(res["map_path"])
-            self.preset.set(CUSTOM)
-            self.preset_note.configure(text="Using the imported file's tranches (the ranges above are ignored).")
-        self.set_message(res["message"], "ok" if res["ok"] else "err")
+        self.set_message("Importing...", "info")
+
+        def done(res: Optional[Dict[str, Any]]) -> None:
+            if res is None:
+                return
+            if res["ok"]:
+                self.v["map_path"].set(res["map_path"])
+                self.preset.set(CUSTOM)
+                self.preset_note.configure(text="Using the imported file's tranches (the ranges above are ignored).")
+            self.set_message(res["message"], "ok" if res["ok"] else "err")
+
+        self.call_async("import_zinc_downloader", path, then=done)
 
     # ---------- docking targets ----------
 
@@ -1583,10 +1623,8 @@ class DockingFlowApp(tk.Tk):
         if not n:
             return
         self.set_message("Exporting poses...", "info")
-        self.update_idletasks()
-        res = self.call("export_poses", self.v["workdir"].get(), self.v["setup_path"].get(), n)
-        if res:
-            self.set_message(res["message"], "ok" if res["ok"] else "err")
+        self.call_async("export_poses", self.v["workdir"].get(), self.v["setup_path"].get(), n,
+                        then=lambda r: r and self.set_message(r["message"], "ok" if r["ok"] else "err"))
 
     def render_status(self, s: Dict[str, Any]) -> None:
         last = self._last_status

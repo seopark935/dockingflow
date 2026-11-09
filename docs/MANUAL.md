@@ -613,6 +613,14 @@ Only ChEMBL screens need it. Install it
 (`conda install -c conda-forge openbabel`) or ask your administrator for the
 `openbabel` package, then click **Check Open Babel**.
 
+**The window freezes or stops responding.**
+It should not: every call that reaches ZINC or ChEMBL, or runs Open Babel,
+happens on a background thread while the window stays live (you will see
+"Counting..." or "the window stays usable"). If it does freeze, note what you
+clicked and report it — and check you are on the current code with
+`git pull` followed by `bash gui.sh restart`, since an older window blocked
+on those calls.
+
 **The run is slower than expected.**
 Check the Resources tab's plan line. Common causes: too few cores allocated, a
 very large (blind-docking) box, or high exhaustiveness.
@@ -687,6 +695,12 @@ Design rules worth preserving:
   recover results after a restart.
 - **A stage that is interrupted records nothing**, so it reruns cleanly.
 - **The run outlives the window.** The server owns the work.
+- **Never call a slow endpoint from the GUI thread.** Anything touching the
+  network or a subprocess goes through `DockingFlowApp.call_async`, whose
+  worker thread touches no Tk widget and hands its result back through a
+  queue that the GUI thread drains. A synchronous call freezes the entire
+  window until the far end answers, which with a catalogue outage means
+  minutes. A test enforces this.
 
 Run the tests after any change:
 

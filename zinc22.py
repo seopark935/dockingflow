@@ -83,7 +83,9 @@ _KEY_RE = re.compile(r"(?:files\.docking\.org/zinc22/|s3://zinc3d/|zinc3d\.s3\.a
 
 # CartBlanche has outages and slow spells, so every read is retried before
 # giving up with an explanation the user can act on.
-RETRIES, RETRY_WAIT_S = 3, 5
+# Kept short: a down CartBlanche should be reported in under a minute, not
+# retried for several. The index is cached once a fetch succeeds.
+RETRIES, RETRY_WAIT_S = 2, 3
 
 
 def _http(url: str, data: Optional[bytes] = None, headers: Optional[dict] = None, timeout: int = 300) -> bytes:
@@ -112,7 +114,7 @@ def load_index(cache_path: Path) -> List[Dict[str, Any]]:
     if cache_path.exists() and time.time() - cache_path.stat().st_mtime < INDEX_MAX_AGE_S:
         return json.loads(cache_path.read_text())
 
-    raw = json.loads(_http(INDEX_URL, timeout=120))
+    raw = json.loads(_http(INDEX_URL, timeout=45))
     index = []
     for t in raw["tranches"]:
         code = t["h_num"] + t["p_num"]

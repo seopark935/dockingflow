@@ -9,6 +9,7 @@ from __future__ import annotations
 import gzip
 import json
 import os
+import re
 import shutil
 import threading
 import time
@@ -428,6 +429,40 @@ class LigandPrepTest(unittest.TestCase):
         self.assertIn("--minimize --ff UFF --steps 250", cmd)
         self.assertTrue(cmd.startswith("/opt/obabel i.sdf -O o.pdbqt"))
         self.assertNotIn("--minimize", " ".join(io_parse.load_prep_options({}).command(Path("i"), Path("o"))))
+
+
+class GuiThreadingTest(unittest.TestCase):
+    """The Tk window must never make a slow call on the GUI thread: it freezes the whole window.
+
+    Checked by reading the source rather than by opening a window, so it
+    runs headless. `gui_tk` is not imported: it needs tkinter, which the
+    server may not have.
+    """
+
+    SLOW_CALLS = ("zinc_summary", "zinc_build", "chembl_summary", "chembl_build", "check_obabel",
+                  "import_zinc_downloader", "export_poses")
+
+    def test_slow_calls_go_through_call_async(self):
+        src = (REPO_ROOT / "gui_tk.py").read_text()
+        for name in self.SLOW_CALLS:
+            self.assertNotIn(f'self.call("{name}"', src,
+                             f"{name} is called synchronously; it must use call_async or the window freezes")
+            self.assertIn(f'"{name}"', src, f"{name} is no longer called at all")
+
+    def test_worker_threads_never_touch_tk(self):
+        src = (REPO_ROOT / "gui_tk.py").read_text()
+        worker = src[src.index("        def work() -> None:"):]
+        worker = worker[:worker.index("\n\n")]
+        self.assertIn("_async_results.put", worker)
+        for forbidden in ("self.after(", "configure(", "set_message"):
+            self.assertNotIn(forbidden, worker, "the worker thread must not touch Tk widgets")
+
+    def test_status_polling_uses_a_short_timeout(self):
+        """get_status runs on the GUI thread every second, so it must give up quickly."""
+        src = (REPO_ROOT / "gui_tk.py").read_text()
+        quick = re.search(r"QUICK = \{([^}]*)\}", src).group(1)
+        self.assertIn('"get_status"', quick)
+        self.assertLessEqual(int(re.search(r"QUICK_TIMEOUT_S = (\d+)", src).group(1)), 60)
 
 
 class StatusTest(unittest.TestCase):
