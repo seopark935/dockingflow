@@ -11,3 +11,13 @@ energy_range=10
 # granularity=0.375
 # seed=<integer>
 # mpi_ranks=<n>                  overrides the cores/memory_gb-based rank count
+# rank_scope=overall             "overall" (top % of the whole screen) or "per_tranche"
+#
+# Ligand preparation -- only used for 2D sources such as ChEMBL, which must be
+# converted to 3D PDBQT with Open Babel before VinaLC can dock them:
+# obabel_bin=obabel              Open Babel binary (name on PATH, or full path)
+# gen3d=fast                     3D effort: fastest, fast, med, slow, slowest
+# forcefield=MMFF94              forcefield used when minimize_steps > 0
+# minimize_steps=0               energy-minimisation steps after 3D generation (0 = skip)
+# prep_ph=7.4                    protonate for this pH
+# prep_jobs=<n>                  parallel obabel processes (default: the run's cores)

@@ -6,6 +6,8 @@ docks them against a receptor with a parallel AutoDock Vina backend
 both a CLI (`pipeline.py`) and a desktop GUI (`gui.py`) built on the same
 underlying code.
 
+- [Lab manual](docs/MANUAL.md) — the step-by-step guide for new users
+  (also as [Word](docs/DockingFlow-Manual.docx))
 - [Glossary](#glossary)
 - [Quick start](#quick-start)
 - [Running on the docking server](#running-on-the-docking-server)
@@ -133,6 +135,27 @@ server, or pywebview installed by `bash gui.sh setup`.
 reach the GUI from your own browser through a MobaXterm SSH tunnel
 instead. The web server listens on localhost only and requires the random
 token in its URL, so other users on a shared server can't control it.
+
+### Compound sources
+
+Two catalogues are supported, chosen on the Ligands tab:
+
+| | **ZINC22** | **ChEMBL** |
+|---|---|---|
+| Contents | purchasable compounds (billions) | bioactive compounds with activity data (~1.9 M small molecules) |
+| Format supplied | 3D PDBQT, ready to dock | 2D SDF |
+| Extra software | none | **Open Babel** on the server |
+| Selected by | heavy atoms, logP, charge | molecular weight, logP |
+| Tranches | ZINC's own (e.g. `H17P050`) | 25 Da weight bins (e.g. `MW250-275`) |
+
+ChEMBL compounds are fetched from its REST API in pages of 1000 (about 10 s
+per page), or as the whole release in one ~1 GB file from EBI's FTP site.
+Because they arrive as flat 2D structures, the unpack stage runs Open Babel
+to generate 3D coordinates, hydrogens, partial charges and AutoDock atom
+types ([`ligprep.py`](ligprep.py)) — VinaLC cannot dock a 2D structure. That
+conversion, not the download, is the slow part of a ChEMBL screen. Use the
+Ligands tab's **Check Open Babel** button once on a new server to confirm the
+install works.
 
 ### ZINC22 downloads
 

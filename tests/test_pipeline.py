@@ -430,6 +430,21 @@ class LigandPrepTest(unittest.TestCase):
         self.assertNotIn("--minimize", " ".join(io_parse.load_prep_options({}).command(Path("i"), Path("o"))))
 
 
+class StatusTest(unittest.TestCase):
+    def test_failed_status_keeps_earlier_stages_done(self):
+        # A failed stage is retried ...
+        self.assertFalse(pipeline.status_at_least("FAILED_UNPACK", "UNPACKED"))
+        self.assertFalse(pipeline.status_at_least("FAILED_DOCK", "DOCKED"))
+        # ... but the stages before it are not redone.
+        self.assertTrue(pipeline.status_at_least("FAILED_UNPACK", "DOWNLOADED"))
+        self.assertTrue(pipeline.status_at_least("FAILED_DOCK", "UNPACKED"))
+        self.assertTrue(pipeline.status_at_least("FAILED_RANK", "DOCKED"))
+        # A failed download has nothing to keep.
+        self.assertFalse(pipeline.status_at_least("FAILED_DOWNLOAD", "DOWNLOADED"))
+        self.assertTrue(pipeline.status_at_least("DONE", "DOCKED"))
+        self.assertFalse(pipeline.status_at_least("NONSENSE", "INIT"))
+
+
 class ResultsTest(unittest.TestCase):
     """Combining tranche rankings, reading results back from disk, and exporting hit poses."""
 

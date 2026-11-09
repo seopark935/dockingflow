@@ -98,9 +98,22 @@ done
 [ -x .venv/bin/python3 ] && .venv/bin/python3 -c "import webview" 2>/dev/null \
     && echo "pywebview window: installed (.venv)"
 
-section "Network access to ZINC"
-curl -s -m 20 -o /dev/null -w 'files.docking.org -> HTTP %{http_code} in %{time_total}s\n' \
+section "Open Babel (only needed for ChEMBL screens)"
+if have obabel; then
+    echo "obabel -> $(command -v obabel): $(obabel -V 2>&1 | head -1)"
+else
+    echo "obabel: NOT INSTALLED -- ChEMBL screens need it to build 3D structures from 2D compounds."
+    echo "  ZINC22 screens work without it. To install without admin rights:"
+    echo "    conda install -c conda-forge openbabel"
+fi
+
+section "Network access to compound sources"
+curl -s -m 20 -o /dev/null -w 'files.docking.org (ZINC22)  -> HTTP %{http_code} in %{time_total}s\n' \
     https://files.docking.org/zinc22/ || echo "cannot reach files.docking.org"
+curl -s -m 20 -o /dev/null -w 'zinc3d.s3.amazonaws.com     -> HTTP %{http_code} in %{time_total}s\n' \
+    https://zinc3d.s3.amazonaws.com/ || echo "cannot reach ZINC's S3 mirror"
+curl -s -m 30 -o /dev/null -w 'www.ebi.ac.uk (ChEMBL)      -> HTTP %{http_code} in %{time_total}s\n' \
+    "https://www.ebi.ac.uk/chembl/api/data/molecule?limit=1&format=json" || echo "cannot reach ChEMBL"
 
 # Machine-readable summary, read by the GUI's "Load server report" button
 # (resources.parse_server_report). Keep the DF_ prefix and KEY=VALUE shape.

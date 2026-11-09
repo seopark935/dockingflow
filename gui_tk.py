@@ -24,6 +24,7 @@ from __future__ import annotations
 import json
 import subprocess
 import sys
+import threading
 import tkinter as tk
 import tkinter.font as tkfont
 import urllib.error
@@ -31,7 +32,7 @@ import urllib.parse
 import urllib.request
 from pathlib import Path
 from tkinter import filedialog, messagebox, simpledialog, ttk
-from typing import Any, Dict, List, Optional
+from typing import Any, Callable, Dict, List, Optional
 
 from chembl import LIGAND_PRESETS as CHEMBL_PRESETS
 from zinc22 import CHARGE_PRESETS, LIGAND_PRESETS, LOGP_BINS, HAC_MAX, HAC_MIN
@@ -261,6 +262,12 @@ class ApiClient:
         self.base = f"{parts.scheme}://{parts.netloc}"
         self.token = (urllib.parse.parse_qs(parts.query).get("token") or [""])[0]
 
+    # Calls that reach out to ZINC/ChEMBL or run Open Babel can take minutes;
+    # polling must fail fast so the window notices a dead server quickly.
+    SLOW_TIMEOUT_S = 600
+    QUICK_TIMEOUT_S = 30
+    QUICK = {"get_status", "server_info", "get_defaults", "get_settings", "get_targets"}
+
     def __getattr__(self, name: str):
         return lambda *args: self._call(name, list(args))
 
@@ -272,7 +279,8 @@ class ApiClient:
             headers={"Content-Type": "application/json", "X-DockingFlow-Token": self.token},
         )
         try:
-            with urllib.request.urlopen(req, timeout=60) as r:
+            timeout = self.QUICK_TIMEOUT_S if name in self.QUICK else self.SLOW_TIMEOUT_S
+            with urllib.request.urlopen(req, timeout=timeout) as r:
                 return json.load(r)
         except urllib.error.HTTPError as e:
             with e:
@@ -356,6 +364,7 @@ class DockingFlowApp(tk.Tk):
         self.targets_dirty = False
         self._plan_job = None
         self._poll_job = None
+        self._async_gen: Dict[str, int] = {}  # newest-wins bookkeeping for call_async
         self._last_status: Dict[str, Any] = {}
 
         self._build()
@@ -364,20 +373,56 @@ class DockingFlowApp(tk.Tk):
 
     # ---------- API plumbing ----------
 
-    def call(self, name: str, *args: Any) -> Any:
-        """Call the server; on a dropped connection, say so and return None."""
+    LOST_SERVER = ("Lost connection to the DockingFlow GUI server. Any run keeps going on the server; "
+                   "run 'bash gui.sh' again to reconnect.")
+    OLD_SERVER = ("The GUI server is running older code than this window (it was started before your last "
+                  "update). Restart it: close this window and run 'bash gui.sh restart'.")
+
+    def _call_raw(self, name: str, *args: Any) -> tuple:
+        """Call the server and return `(result, error_message)`. Touches no widgets, so it is thread-safe."""
         try:
             res = getattr(self.api, name)(*args)
         except ConnectionError:
-            self.set_message(
-                "Lost connection to the DockingFlow GUI server. Any run keeps going on the server; "
-                "run 'bash gui.sh' again to reconnect.", "err",
-            )
-            return None
+            return None, self.LOST_SERVER
         if isinstance(res, dict) and str(res.get("message", "")).startswith("unknown API method"):
-            self.set_message("The GUI server is running older code than this window (it was started before "
-                             "your last update). Restart it: close this window and run 'bash gui.sh restart'.", "err")
+            return res, self.OLD_SERVER
+        return res, None
+
+    def call(self, name: str, *args: Any) -> Any:
+        """Call the server from the GUI thread. Only for calls that are always quick and local.
+
+        Anything that reaches ZINC or ChEMBL, or runs Open Babel, must use
+        `call_async` instead: a synchronous call freezes the whole window
+        until it answers, and those servers can be slow or down.
+        """
+        res, err = self._call_raw(name, *args)
+        if err:
+            self.set_message(err, "err")
         return res
+
+    def call_async(self, name: str, *args: Any, then: Callable[[Any], None], channel: str = "") -> None:
+        """Run a slow call on a worker thread and hand the result to `then` on the GUI thread.
+
+        Only the newest call per `channel` is delivered, so a burst of
+        edits (each triggering a recount) can't have an old answer land on
+        top of a newer one.
+        """
+        chan = channel or name
+        generation = self._async_gen.get(chan, 0) + 1
+        self._async_gen[chan] = generation
+
+        def work() -> None:
+            res, err = self._call_raw(name, *args)
+            self.after(0, lambda: self._deliver(chan, generation, res, err, then))
+
+        threading.Thread(target=work, daemon=True).start()
+
+    def _deliver(self, chan: str, generation: int, res: Any, err: Optional[str], then: Callable) -> None:
+        if generation != self._async_gen.get(chan):
+            return  # superseded by a newer call on this channel
+        if err:
+            self.set_message(err, "err")
+        then(res)
 
     def check_server_version(self) -> bool:
         """Offer to restart a GUI server that predates the code on disk. Returns False if restarting."""

@@ -97,8 +97,18 @@ def _http(url: str, timeout: int = 120) -> bytes:
 
 def _filter_params(mw_min: Optional[float], mw_max: Optional[float],
                    logp_min: Optional[float], logp_max: Optional[float]) -> List[Tuple[str, str]]:
-    """ChEMBL API query parameters for a molecular weight / logP window."""
-    params: List[Tuple[str, str]] = [("molecule_type", "Small molecule")]
+    """ChEMBL API query parameters for a molecular weight / logP window.
+
+    Entries without a structure are excluded. They can't be docked, and
+    worse, a single one of them makes the SDF endpoint fail its *whole*
+    page with "Molecule has no structure records" (HTTP 404), so leaving
+    them in would lose up to 1000 good compounds at a time. Counting uses
+    the same filter, so the count matches what actually downloads.
+    """
+    params: List[Tuple[str, str]] = [
+        ("molecule_type", "Small molecule"),
+        ("molecule_structures__isnull", "false"),
+    ]
     for key, value in (("full_mwt__gte", mw_min), ("full_mwt__lte", mw_max),
                        ("alogp__gte", logp_min), ("alogp__lte", logp_max)):
         if value is not None:

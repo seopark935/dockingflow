@@ -62,15 +62,29 @@ from io_parse import (
 STATUS_ORDER = ["INIT", "DOWNLOADED", "UNPACKED", "DOCKED", "DONE"]
 
 
+# What a FAILED_<STAGE> status implies the tranche *did* finish: everything
+# before the stage that failed. Without this a tranche whose unpack failed
+# would be treated as never downloaded and would fetch everything again,
+# which for a slow source like ChEMBL costs far more than the retry itself.
+REACHED_BEFORE_FAILURE = {
+    "FAILED_DOWNLOAD": "INIT",
+    "FAILED_UNPACK": "DOWNLOADED",
+    "FAILED_DOCK": "UNPACKED",
+    "FAILED_RANK": "DOCKED",
+}
+
+
 def status_at_least(status: str, target: str) -> bool:
     """Return whether `status` has reached or passed `target` in STATUS_ORDER.
 
-    Any status not in STATUS_ORDER (in practice, a `FAILED_*` status) is
-    treated as *not* having reached anything, so a failed tranche is always
-    re-attempted from its failed stage rather than silently skipped.
+    A `FAILED_<STAGE>` status counts as having completed the stages before
+    the one that failed, but never that stage itself, so re-running retries
+    exactly the failed stage and keeps the work already done. Any other
+    unrecognised status counts as having reached nothing.
     """
+    effective = REACHED_BEFORE_FAILURE.get(status, status)
     try:
-        return STATUS_ORDER.index(status) >= STATUS_ORDER.index(target)
+        return STATUS_ORDER.index(effective) >= STATUS_ORDER.index(target)
     except ValueError:
         return False
 
@@ -365,7 +379,8 @@ def download_tranche(tdir: Path) -> None:
         why = f" ({'; '.join(reasons)})" if reasons else ""
         raise RuntimeError(
             f"No ligand files downloaded for {tdir.name}: {len(failed)} download(s) failed{why}. "
-            f"ZINC's index lists some archives that exist on neither of its servers. See {stderr_log}"
+            "Compound catalogues sometimes list files that their servers no longer serve. "
+            f"See {stderr_log}"
         )
 
     if rc != 0:
