@@ -43,7 +43,9 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
+import chembl
 import io_parse
+import ligprep
 import pipeline
 import resources
 import zinc22
@@ -263,10 +265,46 @@ class PipelineAPI:
         except Exception as exc:
             return {"ok": False, "message": str(exc)}
 
+    # ---- ChEMBL picker: filters -> tranche map (no 3D files, so Open Babel is needed) ----
+
+    def chembl_summary(self, filters: dict[str, Any]) -> dict[str, Any]:
+        """How many ChEMBL compounds the current filters select (one API call, can take ~a minute)."""
+        try:
+            return {"ok": True, **chembl.summarize(
+                filters.get("mw_min"), filters.get("mw_max"), filters.get("logp_min"),
+                filters.get("logp_max"), filters.get("source", "api"))}
+        except Exception as exc:
+            return {"ok": False, "message": f"Couldn't reach ChEMBL: {exc}"}
+
+    def chembl_build(self, filters: dict[str, Any]) -> dict[str, Any]:
+        """Build the per-tranche download scripts + tranche map for the chosen ChEMBL compounds."""
+        try:
+            project = ensure_project_dir()
+            map_path = project / "chembl_tranches.txt"
+            res = chembl.build_tranche_map(
+                project / "chembl_scripts", map_path,
+                filters.get("mw_min"), filters.get("mw_max"), filters.get("logp_min"),
+                filters.get("logp_max"), filters.get("source", "api"))
+            n = res.get("molecules")
+            return {"ok": True, "map_path": str(map_path), "message": (
+                f"Tranche list ready: {res['tranches']} tranche(s), {res['files']} download(s)"
+                + (f", about {n:,} compounds" if n else "")
+                + ". ChEMBL compounds are 2D, so they are converted to 3D with Open Babel while unpacking.")}
+        except Exception as exc:
+            return {"ok": False, "message": str(exc)}
+
+    def check_obabel(self, setup_path: str) -> dict[str, Any]:
+        """Verify the server's Open Babel by converting a two-compound sample (ChEMBL screens need it)."""
+        try:
+            setup = io_parse.load_setup(Path(setup_path)) if Path(setup_path).exists() else {}
+            return ligprep.check_obabel(io_parse.load_prep_options(setup))
+        except Exception as exc:
+            return {"ok": False, "message": str(exc)}
+
     # ---- docking settings <-> setup.txt ----
 
     SETTING_KEYS = ("filter_percent", "rank_scope", "exhaustiveness", "num_modes", "energy_range", "seed",
-                    "granularity", "cores", "memory_gb")
+                    "granularity", "cores", "memory_gb", "obabel_bin", "gen3d", "minimize_steps")
 
     def get_settings(self, setup_path: str) -> dict[str, Any]:
         """setup.txt's docking settings, as strings for the form ("" = not set / default)."""
@@ -301,6 +339,7 @@ class PipelineAPI:
             if not 0 < fp <= 100:
                 raise ValueError("Keep top % must be between 0 and 100")
             io_parse.rank_scope(candidate)
+            io_parse.load_prep_options(candidate)
             # Same checks the pipeline itself runs (skipping the memory-based rank
             # planning, which needs valid docking targets).
             io_parse.load_vinalc_options({k: v for k, v in candidate.items() if k != "memory_gb"})
@@ -605,6 +644,8 @@ class PipelineAPI:
 
             filter_percent = float(setup["filter_percent"])
             scope = io_parse.rank_scope(setup)
+            # Ligand preparation (SDF sources only) gets the run's core budget.
+            prep = io_parse.load_prep_options(setup, jobs=int(setup["cores"]))
             mpirun = None if no_mpirun else mpirun_bin
 
             def refresh_results() -> Path:
@@ -629,7 +670,7 @@ class PipelineAPI:
                         stage = "unpack"
                         check()
                         state.log_line(f"[{prog.label}] unpacking...")
-                        pipeline.unpack_tranche(tdir)
+                        pipeline.unpack_tranche(tdir, prep)
                         prog.status = pipeline.read_status(tdir)
 
                         stage = "dock"

@@ -35,6 +35,9 @@ from typing import Any, Dict, List, Optional, Tuple
 # H17P050. The logP code is logP * 100 (M = minus, P = plus).
 ZINC22_TRANCHE_RE = re.compile(r"H(\d{2})([MP])(\d{3})")
 
+# A tranche label becomes a directory name, so keep it to safe characters.
+LABEL_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]*")
+
 # setup.txt keys holding file paths, resolved relative to setup.txt itself.
 SETUP_PATH_KEYS = ("recList", "geoList", "ligList")
 
@@ -43,13 +46,17 @@ SETUP_PATH_KEYS = ("recList", "geoList", "ligList")
 class Tranche:
     """One row of tranches.txt.
 
-    A tranche is identified either by a ZINC22 tranche `code` (with
-    `heavy_atoms`/`log_p` decoded from it) or, for the older map format, by
-    its `(log_p, molecular_weight)` pair.
+    A tranche is identified by one of:
+
+      - a ZINC22 tranche `code` such as `H04M000`, with `heavy_atoms` and
+        `log_p` decoded from it;
+      - any other `code` label (e.g. ChEMBL's `MW250-275`), whose chemistry
+        this file doesn't describe; or
+      - a `(log_p, molecular_weight)` pair, the older ZINC20-style map.
     """
 
     curl_script: Path
-    log_p: float
+    log_p: Optional[float] = None
     molecular_weight: Optional[int] = None
     heavy_atoms: Optional[int] = None
     code: Optional[str] = None
@@ -138,8 +145,10 @@ def load_tranches_tsv(map_path: Path) -> List[Tranche]:
 
     Expects a header row (whitespace-separated) of exactly either:
 
-      - `curl_script tranche`: ZINC22 tranche codes such as `H04M000`, as
-        written by `zinc_split.py`; or
+      - `curl_script tranche`: a label per tranche — a ZINC22 code such as
+        `H04M000` (as written by `zinc_split.py`), whose heavy-atom count
+        and logP are decoded from it, or any other filesystem-safe label
+        (e.g. ChEMBL's `MW250-275`, written by `chembl.py`); or
       - `curl_script log_p molecular_weight`: the older ZINC20-style format.
 
     followed by one data row per tranche. Each `curl_script` entry is
@@ -155,9 +164,9 @@ def load_tranches_tsv(map_path: Path) -> List[Tranche]:
     Raises:
         FileNotFoundError: If `map_path` doesn't exist.
         ValueError: If the file is empty, the header matches neither format,
-            a data row has the wrong number of fields, or a field doesn't
-            parse (bad tranche code, or `log_p`/`molecular_weight` not
-            float/int).
+            a data row has the wrong number of fields, a label isn't
+            filesystem-safe, or `log_p`/`molecular_weight` don't parse as
+            float/int.
     """
     map_path = map_path.expanduser().resolve()
     if not map_path.exists():
@@ -180,10 +189,12 @@ def load_tranches_tsv(map_path: Path) -> List[Tranche]:
             if len(parts) != 2:
                 raise ValueError(f"Line {i}: expected 2 fields (curl_script tranche), got {len(parts)}: {ln}")
             curl_script_s, code = parts
-            try:
+            if not LABEL_RE.fullmatch(code):
+                raise ValueError(f"Line {i}: tranche label must be letters, digits, dot, dash or underscore: {code}")
+            try:  # a ZINC22 code also tells us the tranche's chemistry
                 hac, logp = parse_zinc22_code(code)
-            except ValueError as exc:
-                raise ValueError(f"Line {i}: {exc}")
+            except ValueError:
+                hac, logp = None, None
             curl_script = (map_path.parent / curl_script_s).expanduser().resolve()
             tranches.append(Tranche(curl_script=curl_script, log_p=logp, heavy_atoms=hac, code=code))
         return tranches
@@ -523,6 +534,9 @@ def load_vinalc_options(setup: Dict[str, str]) -> VinaLCOptions:
 # ("overall", the default) or each tranche's own top % ("per_tranche").
 RANK_SCOPES = ("overall", "per_tranche")
 
+# Open Babel's 3D-generation effort levels, slowest to fastest.
+GEN3D_LEVELS = ("slowest", "slow", "med", "fast", "fastest")
+
 
 def rank_scope(setup: Dict[str, str]) -> str:
     """setup.txt's `rank_scope`, validated; "overall" if unset."""
@@ -532,8 +546,37 @@ def rank_scope(setup: Dict[str, str]) -> str:
     return scope
 
 
+def load_prep_options(setup: Dict[str, str], jobs: Optional[int] = None):
+    """setup.txt's ligand-preparation keys as a `ligprep.PrepOptions`.
+
+    Keys (all optional; only used for SDF sources such as ChEMBL):
+    `obabel_bin`, `gen3d`, `forcefield`, `minimize_steps`, `prep_ph`,
+    `prep_jobs`. `jobs` overrides `prep_jobs` (the GUI passes the run's
+    core budget).
+
+    Raises:
+        ValueError: If a numeric key is malformed or `gen3d` isn't one of
+            Open Babel's effort levels.
+    """
+    import ligprep
+
+    gen3d = setup.get("gen3d", "fast")
+    if gen3d not in GEN3D_LEVELS:
+        raise ValueError(f"gen3d must be one of {', '.join(GEN3D_LEVELS)} (got {gen3d!r})")
+    steps = _positive_int(setup, "minimize_steps", minimum=0) if "minimize_steps" in setup else 0
+    configured = _positive_int(setup, "prep_jobs") if "prep_jobs" in setup else None
+    return ligprep.PrepOptions(
+        obabel_bin=setup.get("obabel_bin", "obabel"),
+        gen3d=gen3d,
+        forcefield=setup.get("forcefield", "MMFF94"),
+        minimize_steps=steps,
+        ph=setup.get("prep_ph") or None,
+        jobs=jobs or configured or 1,
+    )
+
+
 def tranche_label(t: Tranche) -> str:
-    """Filesystem-safe, deterministic tranche label (the ZINC22 code when there is one)."""
+    """Filesystem-safe, deterministic tranche label (the code/label when there is one)."""
     if t.code:
         return t.code
     logp = f"{t.log_p:.2f}".rstrip("0").rstrip(".")
@@ -541,8 +584,10 @@ def tranche_label(t: Tranche) -> str:
 
 
 def tranche_size(t: Tranche) -> str:
-    """Human-readable size bin: heavy atom count (ZINC22) or molecular weight (legacy)."""
-    return f"HAC {t.heavy_atoms}" if t.heavy_atoms is not None else f"MW {t.molecular_weight}"
+    """Human-readable size bin: heavy atom count (ZINC22), molecular weight (legacy), or "" if unknown."""
+    if t.heavy_atoms is not None:
+        return f"HAC {t.heavy_atoms}"
+    return f"MW {t.molecular_weight}" if t.molecular_weight is not None else ""
 
 
 def validate_inputs(setup: Dict[str, str], tranches: List[Tranche], workdir: Path) -> None:
@@ -591,6 +636,7 @@ def validate_inputs(setup: Dict[str, str], tranches: List[Tranche], workdir: Pat
 
     load_vinalc_options(setup)
     rank_scope(setup)
+    load_prep_options(setup)
 
     # Fail fast on malformed recList/geoList pairing, or receptors VinaLC
     # can't read, rather than during docking.
@@ -635,8 +681,8 @@ def format_summary(setup: Dict[str, str], tranches: List[Tranche], workdir: Path
         "Choose your real receptor in the Targets tab.\n"
         for t in load_docking_targets(setup) if check_receptor(t.receptor)[1]
     )
-    logps = sorted({t.log_p for t in tranches})
-    sizes = sorted({tranche_size(t) for t in tranches})
+    logps = sorted({t.log_p for t in tranches if t.log_p is not None})
+    sizes = sorted({s for s in (tranche_size(t) for t in tranches) if s})
     return (
         "Inputs look valid.\n"
         f"{warnings}"

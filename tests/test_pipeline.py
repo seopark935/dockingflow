@@ -18,12 +18,15 @@ import subprocess
 import sys
 import tempfile
 import unittest
+import unittest.mock
 from pathlib import Path
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(REPO_ROOT))
 
+import chembl
 import io_parse
+import ligprep
 import pipeline
 import resources
 import web_server
@@ -201,6 +204,230 @@ def _wait_until(pred, timeout: float = 20.0) -> bool:
             return True
         time.sleep(0.1)
     return False
+
+
+# A stub `obabel`: reads an SDF, writes one PDBQT record per input record.
+# `mode` controls the behaviours Open Babel's docs leave unspecified.
+STUB_OBABEL = r"""#!/usr/bin/env python3
+import sys
+from pathlib import Path
+args = sys.argv[1:]
+if args and args[0] == "-V":
+    print("Open Babel 3.1.1 -- stub"); raise SystemExit(0)
+src, out = Path(args[0]), Path(args[args.index("-O") + 1])
+mode = "%MODE%"
+records = [r[1:] if r.startswith("\n") else r for r in src.read_text().split("$$$$") if r.strip()]
+names = []
+for r in records:
+    lines = r.splitlines()
+    tag = [i for i, l in enumerate(lines) if l.startswith("> ") and "chembl_id" in l]
+    if tag and tag[0] + 1 < len(lines):
+        names.append(lines[tag[0] + 1].strip())
+    else:
+        names.append(lines[0].strip() if lines and lines[0].strip() else "?")
+if mode == "drop" and len(records) > 1:
+    records, names = records[1:], names[1:]      # silently loses the first compound
+if mode == "empty":
+    out.write_text(""); raise SystemExit(0)
+blocks = []
+for i, name in enumerate(names, start=1):
+    body = [
+        "REMARK  stub conversion of " + name,
+        "ROOT",
+        "ATOM      1  C   LIG     1       1.000   2.000   %5.3f  1.00  0.00    +0.000 C " % (3.0 + i),
+        "ENDROOT",
+        "TORSDOF 0",
+    ]
+    blocks.append("\n".join(["MODEL %d" % i] + body + ["ENDMDL"]) if mode == "model" else "\n".join(body))
+out.write_text("\n".join(blocks) + "\n")
+"""
+
+
+def write_stub_obabel(path: Path, mode: str = "model") -> Path:
+    path.write_text(STUB_OBABEL.replace("%MODE%", mode))
+    path.chmod(0o755)
+    return path
+
+
+CHEMBL_SDF = """
+     RDKit          2D
+
+  1  0  0  0  0  0  0  0  0  0999 V2000
+    0.0000    0.0000    0.0000 C   0  0  0  0  0  0  0  0  0  0  0  0
+M  END
+>  <chembl_id>
+CHEMBL123
+
+>  <chembl_pref_name>
+ASPIRIN-ISH
+
+$$$$
+
+     RDKit          2D
+
+  1  0  0  0  0  0  0  0  0  0999 V2000
+    0.0000    0.0000    0.0000 N   0  0  0  0  0  0  0  0  0  0  0  0
+M  END
+>  <chembl_id>
+CHEMBL456
+
+$$$$
+"""
+
+
+class ChemblSourceTest(unittest.TestCase):
+    """Selecting ChEMBL compounds and turning the selection into a tranche map (no network)."""
+
+    def setUp(self):
+        self.tmp = Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, self.tmp, ignore_errors=True)
+
+    def test_sdf_record_name_prefers_chembl_id_then_title(self):
+        records = list(chembl.split_sdf_records(CHEMBL_SDF))
+        self.assertEqual([chembl.sdf_record_name(r) for r in records], ["CHEMBL123", "CHEMBL456"])
+        # A non-ChEMBL SDF names its records on the title line, which must survive splitting.
+        titled = "my-compound\n     prog\n\n  0  0\nM  END\n$$$$\n"
+        self.assertEqual(chembl.sdf_record_name(next(chembl.split_sdf_records(titled))), "my-compound")
+
+    def test_bins_cover_the_range_without_gaps(self):
+        edges = chembl.bin_edges(250, 350, width=25)
+        self.assertEqual(edges, [(250, 275), (275, 300), (300, 325), (325, 350)])
+        self.assertEqual([chembl.bin_label(a, b) for a, b in edges[:2]], ["MW250-275", "MW275-300"])
+        self.assertEqual(chembl.bin_label(2.5, 7.5), "MW2p5-7p5")  # no dots in a directory name
+        with self.assertRaises(ValueError):
+            chembl.bin_edges(400, 300)
+
+    def test_page_url_is_ordered_and_filtered(self):
+        url = chembl.page_url(250, 300, None, 3.5, offset=2000)
+        for part in ("molecule.sdf?", "order_by=molecule_chembl_id", "offset=2000", "limit=1000",
+                     "full_mwt__gte=250", "full_mwt__lte=300", "alogp__lte=3.5"):
+            self.assertIn(part, url)
+
+    def test_build_tranche_map_writes_one_script_per_bin(self):
+        counts = {(250.0, 275.0): 1500, (275.0, 300.0): 0, (300.0, 325.0): 10}  # middle bin empty
+        with unittest.mock.patch.object(chembl, "count", lambda lo=None, hi=None, *a, **k: counts[(lo, hi)]):
+            res = chembl.build_tranche_map(self.tmp / "scripts", self.tmp / "map.txt", 250, 325, width=25)
+        self.assertEqual(res["tranches"], 2)
+        self.assertEqual(res["files"], 3)  # 2 pages for the first bin, 1 for the last
+        self.assertEqual(res["molecules"], 1510)
+        tranches = io_parse.load_tranches_tsv(self.tmp / "map.txt")
+        self.assertEqual([t.code for t in tranches], ["MW250-275", "MW300-325"])
+        self.assertIsNone(tranches[0].log_p)  # a weight bin says nothing about logP
+        self.assertEqual(io_parse.tranche_label(tranches[0]), "MW250-275")
+        self.assertEqual(io_parse.tranche_size(tranches[0]), "")
+        script = (self.tmp / "scripts" / "MW250-275.curl").read_text()
+        self.assertEqual(script.count("curl "), 2)
+        self.assertIn("offset=1000", script)
+
+    def test_build_rejects_an_empty_selection(self):
+        with unittest.mock.patch.object(chembl, "count", lambda *a, **k: 0):
+            with self.assertRaises(ValueError) as ctx:
+                chembl.build_tranche_map(self.tmp / "s", self.tmp / "m.txt", 250, 300)
+        self.assertIn("No ChEMBL compounds match", str(ctx.exception))
+
+    def test_tranche_labels_must_be_filesystem_safe(self):
+        (self.tmp / "bad.txt").write_text("curl_script\ttranche\nx.curl\t../escape\n")
+        with self.assertRaises(ValueError):
+            io_parse.load_tranches_tsv(self.tmp / "bad.txt")
+
+
+class LigandPrepTest(unittest.TestCase):
+    """SDF -> 3D PDBQT conversion, driven by a stub Open Babel."""
+
+    def setUp(self):
+        self.tmp = Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, self.tmp, ignore_errors=True)
+
+    def opts(self, mode="model", **kw):
+        return ligprep.PrepOptions(obabel_bin=str(write_stub_obabel(self.tmp / f"obabel_{mode}", mode)), **kw)
+
+    def test_split_pdbqt_records_handles_both_delimiters(self):
+        one = ["REMARK x", "ROOT", "ATOM      1  C   LIG     1       0.0 0.0 1.0  1.00 0.00 +0.0 C", "ENDROOT",
+               "TORSDOF 0"]
+        concatenated = "\n".join(one + one)
+        self.assertEqual(len(ligprep.split_pdbqt_records(concatenated)), 2)
+        modelled = "\n".join(["MODEL 1"] + one + ["ENDMDL", "MODEL 2"] + one + ["ENDMDL"])
+        self.assertEqual(len(ligprep.split_pdbqt_records(modelled)), 2)
+        self.assertEqual(ligprep.split_pdbqt_records("REMARK nothing here\n"), [])
+
+    def test_names_stay_aligned_when_obabel_drops_a_compound(self):
+        records = list(chembl.split_sdf_records(CHEMBL_SDF))
+        names = [chembl.sdf_record_name(r) for r in records]
+        # This stub silently drops the FIRST compound of any batch, so a
+        # naive positional mapping would label CHEMBL456's structure
+        # CHEMBL123. The mismatched count must trigger the one-at-a-time
+        # retry, which both keeps the names right and recovers the compound.
+        converted, warnings = ligprep.convert_records(records, names, self.opts("drop"))
+        self.assertEqual([n for n, _ in converted], ["CHEMBL123", "CHEMBL456"])
+        self.assertEqual(warnings, [])
+        for name, lines in converted:
+            self.assertIn(f"stub conversion of {name}", "\n".join(lines))
+
+    def test_compounds_obabel_cannot_convert_are_named_in_warnings(self):
+        records = list(chembl.split_sdf_records(CHEMBL_SDF))
+        names = [chembl.sdf_record_name(r) for r in records]
+        converted, warnings = ligprep.convert_records(records, names, self.opts("empty"))
+        self.assertEqual(converted, [])
+        self.assertEqual(len(warnings), 2)
+        self.assertTrue(any("CHEMBL123" in w for w in warnings))
+
+    def test_convert_sdf_file_writes_named_models(self):
+        sdf = self.tmp / "page_00001.sdf"
+        sdf.write_text(CHEMBL_SDF)
+        out = self.tmp / "out.pdbqt"
+        for mode in ("model", "concat"):
+            n, warnings = ligprep.convert_sdf_file(sdf, out, self.opts(mode))
+            self.assertEqual((n, warnings), (2, []), mode)
+            text = out.read_text()
+            self.assertEqual(text.count("ENDMDL"), 2, mode)
+            self.assertIn("REMARK  Name = CHEMBL123", text)
+            self.assertIn("REMARK  Name = CHEMBL456", text)
+
+    def test_check_obabel_reports_what_the_install_did(self):
+        res = ligprep.check_obabel(self.opts("model"))
+        self.assertTrue(res["ok"], res)
+        self.assertEqual((res["molecules"], res["expected"]), (2, 2))
+        self.assertEqual(res["delimiter"], "MODEL/ENDMDL")
+        self.assertTrue(res["has_3d"])
+        self.assertTrue(res["names_preserved"])
+
+        empty = ligprep.check_obabel(self.opts("empty"))
+        self.assertFalse(empty["ok"])
+        self.assertIn("no structures", empty["message"])
+
+        missing = ligprep.check_obabel(ligprep.PrepOptions(obabel_bin="definitely-not-installed"))
+        self.assertFalse(missing["ok"])
+        self.assertIn("not installed", missing["message"])
+
+    def test_unpack_converts_sdf_downloads_end_to_end(self):
+        tdir = self.tmp / "tranche"
+        (tdir / "download").mkdir(parents=True)
+        (tdir / "download" / "page_00001.sdf").write_text(CHEMBL_SDF)
+        pipeline.write_status(tdir, "DOWNLOADED")
+        pipeline.unpack_tranche(tdir, self.opts("model"))
+        self.assertEqual(pipeline.read_status(tdir), "UNPACKED")
+        self.assertEqual(pipeline.read_ligand_index(tdir), {1: "CHEMBL123", 2: "CHEMBL456"})
+        ligands = (tdir / "ligands" / "ligands_00001.pdbqt").read_text()
+        self.assertEqual(ligands.count("ENDMDL"), 2)  # VinaLC dock jobs
+
+    def test_unpack_without_obabel_explains(self):
+        tdir = self.tmp / "no_obabel"
+        (tdir / "download").mkdir(parents=True)
+        (tdir / "download" / "page_00001.sdf").write_text(CHEMBL_SDF)
+        pipeline.write_status(tdir, "DOWNLOADED")
+        with self.assertRaises(RuntimeError) as ctx:
+            pipeline.unpack_tranche(tdir, ligprep.PrepOptions(obabel_bin="definitely-not-installed"))
+        self.assertIn("Open Babel", str(ctx.exception))
+        self.assertEqual(pipeline.read_status(tdir), "FAILED_UNPACK")
+
+    def test_prep_options_from_setup(self):
+        opts = io_parse.load_prep_options(
+            {"gen3d": "slow", "minimize_steps": "250", "forcefield": "UFF", "obabel_bin": "/opt/obabel"}, jobs=4)
+        cmd = " ".join(opts.command(Path("i.sdf"), Path("o.pdbqt")))
+        self.assertIn("--gen3d slow", cmd)
+        self.assertIn("--minimize --ff UFF --steps 250", cmd)
+        self.assertTrue(cmd.startswith("/opt/obabel i.sdf -O o.pdbqt"))
+        self.assertNotIn("--minimize", " ".join(io_parse.load_prep_options({}).command(Path("i"), Path("o"))))
 
 
 class ResultsTest(unittest.TestCase):

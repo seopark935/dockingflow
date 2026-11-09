@@ -39,6 +39,7 @@ from pathlib import Path
 from typing import Iterator
 
 import io_parse
+import ligprep
 from io_parse import (
     DockingTarget,
     Tranche,
@@ -113,7 +114,8 @@ class RunControl:
     Every external command runs in its own process group (see `run_cmd`),
     so stopping signals the whole tree at once — the curl script and its
     curls, or mpirun and every VinaLC rank — rather than leaving orphaned
-    ranks burning CPU.
+    ranks burning CPU. Several processes can be registered at once, since
+    ligand preparation runs a few `obabel` conversions in parallel.
     """
 
     GRACE_SECONDS = 10  # SIGTERM first, then SIGKILL whatever is left
@@ -121,7 +123,7 @@ class RunControl:
     def __init__(self) -> None:
         self._stop = threading.Event()
         self._lock = threading.Lock()
-        self._proc: subprocess.Popen | None = None
+        self._procs: set[subprocess.Popen] = set()
 
     def reset(self) -> None:
         self._stop.clear()
@@ -136,16 +138,24 @@ class RunControl:
             raise StopRequested()
 
     def stop(self) -> None:
-        """Request a stop and terminate the running command's whole process tree. Blocks up to GRACE_SECONDS."""
+        """Request a stop and terminate every running command's process tree. Blocks up to GRACE_SECONDS."""
         self._stop.set()
         with self._lock:
-            proc = self._proc
-        if proc is not None:
+            procs = list(self._procs)
+        for proc in procs:
             terminate_tree(proc, self.GRACE_SECONDS)
 
-    def _set_proc(self, proc: subprocess.Popen | None) -> None:
+    def add_process(self, proc: subprocess.Popen) -> None:
+        """Track a child process so `stop` can end it. Kills it at once if a stop already happened."""
         with self._lock:
-            self._proc = proc
+            self._procs.add(proc)
+            stopping = self._stop.is_set()
+        if stopping:
+            terminate_tree(proc, self.GRACE_SECONDS)
+
+    def discard_process(self, proc: subprocess.Popen) -> None:
+        with self._lock:
+            self._procs.discard(proc)
 
 
 # The pipeline's single run control: one run per process (CLI or GUI server).
@@ -201,21 +211,25 @@ def run_cmd(cmd: list[str], cwd: Path, stdout_path: Path, stderr_path: Path) -> 
     t0 = time.time()
     with open(stdout_path, "w", encoding="utf-8") as out, open(stderr_path, "w", encoding="utf-8") as err:
         proc = subprocess.Popen(cmd, cwd=str(cwd), stdout=out, stderr=err, text=True, start_new_session=True)
-        CONTROL._set_proc(proc)
+        CONTROL.add_process(proc)
         try:
             rc = proc.wait()
         except BaseException:
             terminate_tree(proc, RunControl.GRACE_SECONDS)
             raise
         finally:
-            CONTROL._set_proc(None)
+            CONTROL.discard_process(proc)
     CONTROL.check()  # killed by a stop: don't let the caller record a result
     return rc, time.time() - t0
 
 
 # Downloaded ligand files the unpack stage knows how to read: ZINC22 3D
 # archives (.pdbqt.tgz), ZINC20-style gzipped pdbqt, and plain pdbqt.
-ARCHIVE_SUFFIXES = (".pdbqt.tgz", ".pdbqt.tar.gz", ".pdbqt.gz", ".pdbqt")
+ARCHIVE_SUFFIXES = (".pdbqt.tgz", ".pdbqt.tar.gz", ".pdbqt.gz", ".pdbqt", ".sdf", ".sdf.gz")
+
+# Downloads needing 3D generation + AutoDock typing before docking (ChEMBL
+# and most catalogues other than ZINC22). See `ligprep`.
+SDF_SUFFIXES = (".sdf", ".sdf.gz")
 
 
 def find_ligand_archives(download_dir: Path) -> list[Path]:
@@ -443,7 +457,44 @@ def split_molecules(source_name: str, text: str) -> Iterator[tuple[str, list[str
         yield name, block
 
 
-def unpack_tranche(tdir: Path) -> Path:
+def convert_sdf_archives(tdir: Path, sdf_files: list[Path], prep: ligprep.PrepOptions) -> tuple[list[Path], list[str]]:
+    """Convert downloaded SDF compounds to 3D PDBQT with Open Babel, into `<tdir>/converted/`.
+
+    ChEMBL and most catalogues other than ZINC22 ship 2D SDF, which can't
+    be docked directly. Returns the converted files and any warnings.
+
+    Raises:
+        RuntimeError: If Open Babel isn't installed.
+    """
+    if not ligprep.available(prep):
+        raise RuntimeError(
+            f"These compounds are SDF and need 3D conversion, but Open Babel ({prep.obabel_bin}) isn't "
+            "installed or isn't on PATH. Install it on the server, or set obabel_bin in the settings file. "
+            "(ZINC22 screens don't need it: ZINC ships ready-to-dock 3D files.)")
+
+    out_dir = tdir / "converted"
+    if out_dir.exists():
+        shutil.rmtree(out_dir)
+    out_dir.mkdir(parents=True)
+
+    converted: list[Path] = []
+    warnings: list[str] = []
+    total = 0
+    for i, sdf in enumerate(sdf_files, start=1):
+        CONTROL.check()
+        out_path = out_dir / f"{sdf.stem.replace('.sdf', '')}_{i:05d}.pdbqt"
+        n, warns = ligprep.convert_sdf_file(sdf, out_path, prep, control=CONTROL)
+        warnings += warns
+        if n:
+            converted.append(out_path)
+            total += n
+        else:
+            out_path.unlink(missing_ok=True)
+        print(f"[prep] {tdir.name}: {total} compound(s) converted to 3D ({i}/{len(sdf_files)} file(s))")
+    return converted, warnings
+
+
+def unpack_tranche(tdir: Path, prep: ligprep.PrepOptions | None = None) -> Path:
     """Repackage a tranche's downloaded ligands into VinaLC's multi-molecule input format.
 
     VinaLC treats every `MODEL`...`ENDMDL` block of each file in its ligList
@@ -492,13 +543,32 @@ def unpack_tranche(tdir: Path) -> Path:
         write_status(tdir, "FAILED_UNPACK")
         raise RuntimeError(f"No ligand files found to unpack in {tdir / 'download'}")
 
+    # SDF downloads (ChEMBL) are 2D: generate 3D structures before unpacking.
+    prep_warnings: list[str] = []
+    sdf_files = [a for a in archives if a.name.endswith(SDF_SUFFIXES)]
+    if sdf_files:
+        try:
+            converted, prep_warnings = convert_sdf_archives(tdir, sdf_files, prep or ligprep.PrepOptions())
+        except StopRequested:
+            raise
+        except Exception:
+            write_status(tdir, "FAILED_UNPACK")
+            raise
+        archives = [a for a in archives if a not in sdf_files] + converted
+        if not archives:
+            write_text(tdir / "unpack_warnings.txt", "".join(f"{w}\n" for w in prep_warnings))
+            write_status(tdir, "FAILED_UNPACK")
+            raise RuntimeError(
+                f"{tdir.name}: Open Babel converted none of the {len(sdf_files)} downloaded SDF file(s) to 3D. "
+                f"See {tdir / 'unpack_warnings.txt'}")
+
     # Start clean so a previously interrupted unpack can't leave stale chunks behind.
     if ligands_dir.exists():
         shutil.rmtree(ligands_dir)
     ligands_dir.mkdir(parents=True)
 
     ligand_files: list[Path] = []
-    warnings: list[str] = []
+    warnings: list[str] = list(prep_warnings)
     n = 0
     out = None
     with open(tdir / "ligand_index.tsv", "w", encoding="utf-8") as index:
@@ -1162,7 +1232,7 @@ def _main() -> int:
         return finish("Download stage complete")
 
     # Stage 2: unpack downloaded ligands
-    run_stage("unpack", unpack_tranche)
+    run_stage("unpack", unpack_tranche, io_parse.load_prep_options(setup, jobs=int(setup["cores"])))
     if args.only_unpack:
         return finish("Unpack stage complete")
 

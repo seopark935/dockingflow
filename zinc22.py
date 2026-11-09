@@ -81,10 +81,26 @@ CHARGE_PRESETS = {
 _KEY_RE = re.compile(r"(?:files\.docking\.org/zinc22/|s3://zinc3d/|zinc3d\.s3\.amazonaws\.com/)(zinc-22\w/\S+)")
 
 
+# CartBlanche has outages and slow spells, so every read is retried before
+# giving up with an explanation the user can act on.
+RETRIES, RETRY_WAIT_S = 3, 5
+
+
 def _http(url: str, data: Optional[bytes] = None, headers: Optional[dict] = None, timeout: int = 300) -> bytes:
-    req = urllib.request.Request(url, data=data, headers=headers or {}, method="POST" if data else "GET")
-    with urllib.request.urlopen(req, timeout=timeout) as r:
-        return r.read()
+    last: Exception | None = None
+    for attempt in range(RETRIES):
+        try:
+            req = urllib.request.Request(url, data=data, headers={"User-Agent": "DockingFlow", **(headers or {})},
+                                         method="POST" if data else "GET")
+            with urllib.request.urlopen(req, timeout=timeout) as r:
+                return r.read()
+        except Exception as exc:  # noqa: BLE001 - every network failure is retried the same way
+            last = exc
+            if attempt < RETRIES - 1:
+                time.sleep(RETRY_WAIT_S * (attempt + 1))
+    raise RuntimeError(
+        f"ZINC's tranche server ({urllib.parse.urlparse(url).netloc}) didn't respond after {RETRIES} attempts "
+        f"({last}). It has regular outages; try again later, or switch the compound source to ChEMBL.")
 
 
 def load_index(cache_path: Path) -> List[Dict[str, Any]]:

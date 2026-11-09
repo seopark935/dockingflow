@@ -33,6 +33,7 @@ from pathlib import Path
 from tkinter import filedialog, messagebox, simpledialog, ttk
 from typing import Any, Dict, List, Optional
 
+from chembl import LIGAND_PRESETS as CHEMBL_PRESETS
 from zinc22 import CHARGE_PRESETS, LIGAND_PRESETS, LOGP_BINS, HAC_MAX, HAC_MIN
 
 POLL_MS = 1000
@@ -66,6 +67,11 @@ PHASE_PILL = {  # run phase -> (text, fg, bg)
 CHARGES = {"J": "-4", "K": "-3", "L": "-2", "M": "-1", "N": "0", "O": "+1", "P": "+2", "Q": "+3", "R": "+4"}
 CUSTOM = "Custom"
 
+# Where compounds come from. ZINC22 ships 3D structures VinaLC can dock as
+# they are; ChEMBL ships 2D, so it needs Open Babel on the server.
+SOURCES = {"ZINC22 (ready-to-dock 3D)": "zinc22", "ChEMBL (2D, needs Open Babel)": "chembl"}
+CHEMBL_FETCH = {"Filtered selection (resumable)": "api", "Whole release in one file": "ftp"}
+
 # How "Keep top %" picks the final hits (setup.txt's rank_scope).
 RANK_SCOPES = {"the whole screen": "overall", "each tranche separately": "per_tranche"}
 DEFAULT_PRESET = "Quick test (~1,000 molecules)"
@@ -91,6 +97,40 @@ HELP = {
         "Then click Validate to check everything, and Run pipeline to start. You can close this window "
         "at any time; the run keeps going on the server. Reopen it with 'bash gui.sh'.\n\n"
         "Tip: start with the default 'Quick test' library to make sure everything works before a big screen."),
+    "source": (
+        "Compound source",
+        "Where the compounds to screen come from.\n\n"
+        "- ZINC22: purchasable compounds, already prepared as 3D structures with AutoDock atom types. "
+        "Nothing extra to install, and the fastest route to docking.\n"
+        "- ChEMBL: bioactive compounds with measured activity data, about 1.9 million small molecules. "
+        "ChEMBL distributes flat 2D structures, so each compound must be given 3D coordinates, hydrogens "
+        "and charges first. DockingFlow does that with Open Babel, which must be installed on this "
+        "server; use 'Check Open Babel' to confirm. That conversion is the slow step of a ChEMBL screen "
+        "(roughly 0.1-1 s per compound per core).\n\n"
+        "Pick ChEMBL for compounds with known bioactivity; pick ZINC22 for purchasable chemical space."),
+    "chembl_filters": (
+        "ChEMBL filters",
+        "Compounds are selected by molecular weight (Da) and logP (ChEMBL's 'alogp'). Leave a box empty "
+        "for no limit on that end.\n\n"
+        "The selection is split into 25 Da weight bins, one tranche each, so the screen is resumable and "
+        "results appear bin by bin.\n\n"
+        "Counting asks ChEMBL's servers and can take up to a minute for wide filters."),
+    "chembl_fetch": (
+        "How ChEMBL is fetched",
+        "- Filtered selection (recommended): compounds come from ChEMBL's web API in pages of 1000, about "
+        "10 seconds per page. Honours your filters and splits into one resumable tranche per weight bin.\n"
+        "- Whole release in one file: downloads the complete release (about 1 GB) from EBI's FTP site. "
+        "Much quicker for all ~1.9 million compounds, but it arrives as a single tranche: no per-tranche "
+        "checkpoints, filters are ignored, and docking runs as one very long job."),
+    "obabel": (
+        "Open Babel",
+        "The chemistry toolkit that turns ChEMBL's 2D structures into dockable 3D PDBQT files. Needed "
+        "only for ChEMBL screens.\n\n"
+        "'Check Open Babel' converts two sample compounds and reports what your install actually did: its "
+        "version, whether 3D coordinates were produced, and whether compound names survived. Run it once "
+        "on a new server before a ChEMBL screen.\n\n"
+        "If it is missing, install it (for example 'conda install -c conda-forge openbabel') or ask your "
+        "administrator for the 'openbabel' package; set its path in the Docking tab if it is not on PATH."),
     "library": (
         "Ligand library",
         "ZINC22 is a free database of billions of purchasable compounds, split into 'tranches' by size "
@@ -294,6 +334,11 @@ class DockingFlowApp(tk.Tk):
         self.hac_min, self.hac_max = tk.StringVar(self), tk.StringVar(self)
         self.logp_min, self.logp_max = tk.StringVar(self), tk.StringVar(self)
         self.charge_preset = tk.StringVar(self)
+        self.source = tk.StringVar(self, value="ZINC22 (ready-to-dock 3D)")
+        self.chembl_preset = tk.StringVar(self, value="Quick test (~900 molecules)")
+        self.chembl_fetch = tk.StringVar(self, value="Filtered selection (resumable)")
+        self.mw_min, self.mw_max = tk.StringVar(self), tk.StringVar(self)
+        self.clogp_min, self.clogp_max = tk.StringVar(self), tk.StringVar(self)
         self.charges = {c: tk.BooleanVar(self) for c in CHARGES}
         self._applying_preset = False
         self._zinc_job = None
@@ -527,7 +572,35 @@ class DockingFlowApp(tk.Tk):
         self.pill.configure(text=text, fg=fg, bg=bg)
 
     def _build_ligands(self, f: ttk.Frame) -> None:
-        self.heading(f, "Ligand library", "library", pady=(0, 4))
+        self.heading(f, "Compound source", "source", pady=(0, 4))
+        src = ttk.Combobox(f, textvariable=self.source, state="readonly", values=list(SOURCES))
+        src.pack(fill=tk.X)
+        src.bind("<<ComboboxSelected>>", lambda _e: self.source_changed())
+
+        self.zinc_frame = ttk.Frame(f)
+        self._build_zinc_filters(self.zinc_frame)
+        self.chembl_frame = ttk.Frame(f)
+        self._build_chembl_filters(self.chembl_frame)
+        self.zinc_frame.pack(fill=tk.X)
+
+        summary = ttk.Frame(f, style="Card.TFrame", padding=8)
+        summary.pack(fill=tk.X, pady=(10, 0))
+        self.zinc_count = ttk.Label(summary, text="", style="Big.TLabel")
+        self.zinc_count.pack(anchor="w")
+        self.zinc_label = ttk.Label(summary, text="", style="Muted.TLabel", wraplength=330, justify=tk.LEFT)
+        self.zinc_label.pack(anchor="w")
+        ttk.Button(summary, text="Create tranche list", style="Accent.TButton",
+                   command=self.build_tranche_list).pack(anchor="w", pady=(6, 0))
+
+        self.heading(f, "Tranche list", "tranche_list")
+        self.path_row(f, self.v["map_path"], "file")
+        self.import_btn = ttk.Button(f, text="Import a CartBlanche22 file instead...", command=self.import_zinc)
+        self.import_btn.pack(anchor="w", pady=(4, 0))
+        self.heading(f, "Work directory", "workdir")
+        self.path_row(f, self.v["workdir"], "folder")
+
+    def _build_zinc_filters(self, f: ttk.Frame) -> None:
+        self.heading(f, "ZINC22 library", "library", pady=(8, 4))
         combo = ttk.Combobox(f, textvariable=self.preset, state="readonly",
                              values=list(LIGAND_PRESETS) + [CUSTOM])
         combo.pack(fill=tk.X)
@@ -566,20 +639,42 @@ class DockingFlowApp(tk.Tk):
         for c, label in CHARGES.items():
             ttk.Checkbutton(boxes, text=label, variable=self.charges[c], command=self.charges_changed).pack(side=tk.LEFT)
 
-        summary = ttk.Frame(f, style="Card.TFrame", padding=8)
-        summary.pack(fill=tk.X, pady=(10, 0))
-        self.zinc_count = ttk.Label(summary, text="", style="Big.TLabel")
-        self.zinc_count.pack(anchor="w")
-        self.zinc_label = ttk.Label(summary, text="", style="Muted.TLabel", wraplength=330, justify=tk.LEFT)
-        self.zinc_label.pack(anchor="w")
-        ttk.Button(summary, text="Create tranche list", style="Accent.TButton", command=self.zinc_build).pack(
-            anchor="w", pady=(6, 0))
+    def _build_chembl_filters(self, f: ttk.Frame) -> None:
+        self.heading(f, "ChEMBL library", "chembl_filters", pady=(8, 4))
+        combo = ttk.Combobox(f, textvariable=self.chembl_preset, state="readonly",
+                             values=list(CHEMBL_PRESETS) + [CUSTOM])
+        combo.pack(fill=tk.X)
+        combo.bind("<<ComboboxSelected>>", lambda _e: self.apply_chembl_preset())
+        self.chembl_note = ttk.Label(f, text="", style="Muted.TLabel", wraplength=340, justify=tk.LEFT)
+        self.chembl_note.pack(fill=tk.X, pady=(3, 0))
 
-        self.heading(f, "Tranche list", "tranche_list")
-        self.path_row(f, self.v["map_path"], "file")
-        ttk.Button(f, text="Import a CartBlanche22 file instead...", command=self.import_zinc).pack(anchor="w", pady=(4, 0))
-        self.heading(f, "Work directory", "workdir")
-        self.path_row(f, self.v["workdir"], "folder")
+        grid = ttk.Frame(f)
+        grid.pack(fill=tk.X, pady=(8, 0))
+        for r, (label, lo, hi, hint) in enumerate((
+            ("Weight (Da)", self.mw_min, self.mw_max, "blank = no limit"),
+            ("logP", self.clogp_min, self.clogp_max, "oral drugs: about -1 to 5"),
+        )):
+            ttk.Label(grid, text=label).grid(row=r * 2, column=0, sticky="w", pady=(2, 0))
+            for col, var in ((1, lo), (3, hi)):
+                ttk.Entry(grid, textvariable=var, width=7, justify=tk.RIGHT).grid(
+                    row=r * 2, column=col, padx=2, pady=(2, 0))
+                var.trace_add("write", lambda *_: self.chembl_ranges_changed())
+            ttk.Label(grid, text="to").grid(row=r * 2, column=2)
+            ttk.Label(grid, text=hint, style="Muted.TLabel").grid(row=r * 2 + 1, column=1, columnspan=4, sticky="w")
+
+        fetch = ttk.Frame(f)
+        fetch.pack(fill=tk.X, pady=(6, 0))
+        ttk.Label(fetch, text="Fetch").pack(side=tk.LEFT)
+        fc = ttk.Combobox(fetch, textvariable=self.chembl_fetch, state="readonly",
+                          values=list(CHEMBL_FETCH), width=26)
+        fc.pack(side=tk.LEFT, padx=6)
+        fc.bind("<<ComboboxSelected>>", lambda _e: self.chembl_ranges_changed())
+        self.help_button(fetch, "chembl_fetch").pack(side=tk.LEFT)
+
+        obabel = ttk.Frame(f)
+        obabel.pack(fill=tk.X, pady=(6, 0))
+        ttk.Button(obabel, text="Check Open Babel", command=self.check_obabel).pack(side=tk.LEFT)
+        self.help_button(obabel, "obabel").pack(side=tk.LEFT, padx=4)
 
     def _build_targets_tab(self, f: ttk.Frame) -> None:
         self.heading(f, "Receptors and grid boxes", "targets", pady=(0, 4))
@@ -851,6 +946,126 @@ class DockingFlowApp(tk.Tk):
             return False
         return self.save_settings()
 
+    # ---------- compound source ----------
+
+    def source_changed(self) -> None:
+        """Show the selected source's filters and recount."""
+        chembl_source = SOURCES[self.source.get()] == "chembl"
+        self.zinc_frame.pack_forget()
+        self.chembl_frame.pack_forget()
+        (self.chembl_frame if chembl_source else self.zinc_frame).pack(fill=tk.X)
+        if chembl_source and not self.chembl_note.cget("text"):
+            self.apply_chembl_preset()  # also triggers the recount
+        else:
+            self.schedule_zinc_summary()
+
+    def build_tranche_list(self) -> None:
+        """Create the tranche list from whichever source is selected."""
+        if SOURCES[self.source.get()] == "chembl":
+            self.chembl_build()
+        else:
+            self.zinc_build()
+
+    # ---------- ChEMBL picker ----------
+
+    def apply_chembl_preset(self) -> None:
+        preset = CHEMBL_PRESETS.get(self.chembl_preset.get())
+        if not preset:
+            self.chembl_note.configure(text="Set the weight and logP range below yourself.")
+            return
+        self._applying_preset = True
+        for var, value in ((self.mw_min, preset["mw"][0]), (self.mw_max, preset["mw"][1]),
+                           (self.clogp_min, preset["logp"][0]), (self.clogp_max, preset["logp"][1])):
+            var.set("" if value is None else f"{value:g}")
+        self._applying_preset = False
+        self.chembl_note.configure(text=preset["help"])
+        self.chembl_ranges_changed(from_preset=True)
+
+    def chembl_ranges_changed(self, from_preset: bool = False) -> None:
+        if not from_preset and not self._applying_preset:
+            self.chembl_preset.set(CUSTOM)
+            self.chembl_note.configure(text="Custom selection.")
+        self.schedule_zinc_summary()
+
+    def _chembl_filters(self) -> Optional[Dict[str, Any]]:
+        """The ChEMBL filters as the API wants them, or None if a box isn't a sensible number."""
+        out: Dict[str, Any] = {"source": CHEMBL_FETCH[self.chembl_fetch.get()]}
+        for key, var in (("mw_min", self.mw_min), ("mw_max", self.mw_max),
+                         ("logp_min", self.clogp_min), ("logp_max", self.clogp_max)):
+            text = var.get().strip()
+            if not text:
+                out[key] = None
+                continue
+            try:
+                out[key] = float(text)
+            except ValueError:
+                return None
+        for lo, hi in (("mw_min", "mw_max"), ("logp_min", "logp_max")):
+            if out[lo] is not None and out[hi] is not None and out[lo] > out[hi]:
+                return None
+        return out
+
+    def refresh_chembl_summary(self) -> None:
+        filters = self._chembl_filters()
+        if filters is None:
+            self.zinc_count.configure(text="Nothing selected")
+            self.zinc_label.configure(text="Weight and logP must be numbers, with each 'from' <= its 'to'.")
+            return
+        self.zinc_count.configure(text="Counting...")
+        self.zinc_label.configure(text="(asking ChEMBL; wide filters can take up to a minute)")
+        self.update_idletasks()
+        res = self.call("chembl_summary", filters)
+        if res is None:
+            return
+        if not res["ok"]:
+            self.zinc_count.configure(text="Couldn't count")
+            self.zinc_label.configure(text=res["message"])
+            return
+        n = res["molecules"]
+        self.zinc_count.configure(text=f"~{n:,} compounds")
+        if res.get("whole_release"):
+            note = "the whole ChEMBL release as one tranche (~1 GB); the filters above are ignored in this mode."
+        else:
+            note = f"in {res['tranches']:,} tranche(s) of 25 Da each."
+            hours = n * 0.01 / 3600  # ~10 s per 1000 compounds through the API
+            if hours >= 1:
+                note += f" Downloading alone will take roughly {hours:.0f} h."
+        note += " Every compound is converted to 3D with Open Babel before docking."
+        if n >= LARGE_SCREEN:
+            note += " That's a very large screen; consider narrowing it or starting with a quick test."
+        self.zinc_label.configure(text=note)
+
+    def chembl_build(self) -> None:
+        filters = self._chembl_filters()
+        if filters is None:
+            self.set_message("Check the ChEMBL filters: weight and logP must be numbers, each 'from' <= its 'to'.",
+                             "err")
+            return
+        summary = self.call("chembl_summary", filters)
+        if summary and summary.get("ok") and summary["molecules"] > LARGE_SCREEN and not messagebox.askyesno(
+            "Large screen",
+            f"This selection is about {summary['molecules']:,} compounds.\n\n"
+            "Each one is converted to 3D and then docked, which takes a very long time and a lot of disk. "
+            "Create the list anyway?",
+        ):
+            return
+        self.set_message("Asking ChEMBL for the compound list...", "info")
+        self.update_idletasks()
+        res = self.call("chembl_build", filters)
+        if res is None:
+            return
+        if res["ok"]:
+            self.v["map_path"].set(res["map_path"])
+        self.set_message(res["message"] + (" Next: tab 2, Targets." if res["ok"] else ""),
+                         "ok" if res["ok"] else "err")
+
+    def check_obabel(self) -> None:
+        self.set_message("Checking Open Babel...", "info")
+        self.update_idletasks()
+        res = self.call("check_obabel", self.v["setup_path"].get())
+        if res:
+            self.set_message(res["message"], "ok" if res["ok"] else "err")
+
     # ---------- ligand library: presets + ranges + charges ----------
 
     def apply_preset(self) -> None:
@@ -916,7 +1131,11 @@ class DockingFlowApp(tk.Tk):
         self._zinc_job = self.after(300, self.refresh_zinc_summary)
 
     def refresh_zinc_summary(self) -> None:
+        """Refresh the compound count for whichever source is selected."""
         self._zinc_job = None
+        if SOURCES[self.source.get()] == "chembl":
+            self.refresh_chembl_summary()
+            return
         filters = self._zinc_filters()
         if filters is None:
             self.zinc_count.configure(text="Nothing selected")
